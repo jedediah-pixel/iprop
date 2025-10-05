@@ -84,6 +84,32 @@ def _area_to_sqft(value, unit_txt):
         return value * 10.7639
     return value
 
+def _normalize_land_unit(unit_txt):
+    if not unit_txt:
+        return ""
+    u = str(unit_txt).strip().lower()
+    if not u:
+        return ""
+    u = u.replace(".", " ").replace(",", " ")
+    u = re.sub(r"\s+", " ", u)
+    if "acre" in u or re.fullmatch(r"ac", u):
+        return "acre"
+    if "hectar" in u or re.fullmatch(r"ha", u):
+        return "hectare"
+    if "sq" in u and ("ft" in u or "feet" in u or "foot" in u or "sf" in u):
+        return "sq ft"
+    if "sf" == u:
+        return "sq ft"
+    if "sq" in u and ("m" in u or "metre" in u or "meter" in u or "m2" in u or "m²" in u):
+        return "sqm"
+    if "m2" == u or "m²" == u:
+        return "sqm"
+    if "sq" in u and ("yd" in u or "yard" in u):
+        return "sq yd"
+    if "perch" in u:
+        return "perch"
+    return u
+
 def jget(obj, path):
     cur = obj
     try:
@@ -214,6 +240,159 @@ def _extract_state_metatable_blocks(html):
     ):
         yield mm.group(1)
 
+
+def extract_land_area(html, soup):
+    DIM_RE = re.compile(
+        r"(\d+(?:[\.,]\d+)?)\s*[x×]\s*(\d+(?:[\.,]\d+)?)(?:\s*(?:[x×]\s*(\d+(?:[\.,]\d+)?)))?\s*([A-Za-z²°\s]*)",
+        re.I,
+    )
+    AREA_RE = re.compile(
+        r"([0-9][0-9,\.]*)(?:\s*-\s*[0-9][0-9,\.]*)?\s*(sq\.?\s*ft|sqft|sf|square\s*feet|sq\.?\s*m|sqm|square\s*met(?:er|re)|m²|ha\b|hectare(?:s)?|ac\b|acre(?:s)?|sq\.?\s*yd|square\s*y(?:ard|d)|perch(?:es)?)",
+        re.I,
+    )
+    KEYWORDS_RE = re.compile(r"\b(land|lot|site|dimension|dimensi|tanah)\b", re.I)
+
+    raw_hits = []
+    seen_raw = set()
+    candidates = []  # (value, unit, raw, priority)
+
+    def add_raw(text):
+        if not text:
+            return
+        cleaned = re.sub(r"\s+", " ", str(text)).strip()
+        if cleaned:
+            key = cleaned.lower()
+            if key not in seen_raw:
+                seen_raw.add(key)
+                raw_hits.append(cleaned)
+
+    def add_candidate(value, unit, raw_text, priority):
+        if value is None:
+            return
+        if isinstance(value, (int, float)):
+            num = float(value)
+        else:
+            num = _num(value)
+        if num is None or num <= 0:
+            return
+        unit_norm = _normalize_land_unit(unit)
+        if not unit_norm and raw_text:
+            unit_norm = _normalize_land_unit(raw_text)
+        add_raw(raw_text or value)
+        candidates.append((num, unit_norm, raw_text or str(value), priority))
+
+    def find_unit_hint(text):
+        t = (text or "").lower()
+        for token in ["sq ft", "sqft", "sf", "square feet", "sq. ft", "ft²", "ft2"]:
+            if token in t:
+                return "sq ft"
+        for token in ["sq m", "sqm", "square metre", "square meter", "m²", "m2"]:
+            if token in t:
+                return "sqm"
+        for token in ["sq yd", "square yard", "square yards", "sq. yd", "sqyd"]:
+            if token in t:
+                return "sq yd"
+        for token in ["acre", "acres", "ac "]:
+            if token in t:
+                return "acre"
+        for token in ["hectare", "hectares", "ha "]:
+            if token in t:
+                return "hectare"
+        if "perch" in t:
+            return "perch"
+        return ""
+
+    def parse_text(text, force=False):
+        if not text:
+            return
+        cleaned = re.sub(r"\s+", " ", str(text)).strip()
+        if not cleaned:
+            return
+        dim_found = False
+        for dim in DIM_RE.finditer(cleaned):
+            w = _num(dim.group(1))
+            l = _num(dim.group(2))
+            h = _num(dim.group(3)) if dim.group(3) else None
+            unit_hint = dim.group(4) or ""
+            unit = _normalize_land_unit(unit_hint) or find_unit_hint(cleaned)
+            if w and l and unit:
+                area = w * l
+                if h and unit == "sqm":
+                    area *= h
+                add_candidate(area, unit, cleaned, 3)
+                dim_found = True
+        area_found = False
+        for match in AREA_RE.finditer(cleaned):
+            val = _num(match.group(1))
+            unit = _normalize_land_unit(match.group(2))
+            if val and unit:
+                add_candidate(val, unit, cleaned, 2)
+                area_found = True
+        if dim_found or area_found:
+            return
+        if not force and not KEYWORDS_RE.search(cleaned):
+            return
+        val = _num(cleaned)
+        if val:
+            unit = find_unit_hint(cleaned)
+            priority = 1 if unit else 0
+            add_candidate(val, unit, cleaned, priority)
+
+    for root in _collect_all_json(soup):
+        listing = jget(root, ["listingData"])
+        if isinstance(listing, dict):
+            la = listing.get("landArea")
+            la_text = (
+                listing.get("landAreaText")
+                or listing.get("landAreaDisplay")
+                or listing.get("landAreaValue")
+                or listing.get("landSizeDisplay")
+                or listing.get("landSizeText")
+            )
+            unit_hint = (
+                listing.get("landAreaUnit")
+                or listing.get("landAreaUnitType")
+                or listing.get("landSizeUnit")
+                or listing.get("landSizeUnitType")
+            )
+            if la is not None and la != "":
+                add_candidate(la, unit_hint or find_unit_hint(la_text or ""), f"landArea={la}", 1)
+            parse_text(la_text, force=True)
+        details = jget(root, ["detailsData", "metatable", "items"]) or jget(root, ["detailsData", "metaTable", "items"])
+        if isinstance(details, list):
+            for item in details:
+                if isinstance(item, dict):
+                    txt = item.get("value") or item.get("valueText") or item.get("text")
+                    parse_text(txt)
+        overview = jget(root, ["propertyOverviewData", "propertyInfo"])
+        if isinstance(overview, dict):
+            parse_text(overview.get("landArea"), force=True)
+            parse_text(overview.get("landAreaDisplay"), force=True)
+
+    for match in re.finditer(r'"landArea(?:Text|Display|Value)?"\s*:\s*"([^"]+)"', html, re.I):
+        parse_text(match.group(1), force=True)
+    for match in re.finditer(r'"(?:landArea|landSize)"\s*:\s*([0-9][0-9,\.]*)', html, re.I):
+        add_candidate(match.group(1), "", match.group(0), 1)
+
+    selectors = [
+        ".meta-table__item",
+        ".meta-table__item__wrapper",
+        ".meta-table__item__wrapper__value",
+        "[class*='land']",
+        "[da-id='metatable-item']",
+    ]
+    try:
+        for node in soup.select(", ".join(selectors)):
+            txt = node.get_text(" ", strip=True)
+            parse_text(txt)
+    except Exception:
+        pass
+
+    if candidates:
+        candidates.sort(key=lambda x: (x[3], 1 if x[1] else 0, x[0]), reverse=True)
+        best = candidates[0]
+        return best[0], best[1], raw_hits
+    return None, "", raw_hits
 
 
 def extract_builtup(html, soup):
@@ -448,6 +627,154 @@ def extract_lister_phone(soup):
         raw = str(best_candidates[0]).strip()
         digits = _digits_only(raw)
     return raw, digits
+
+def extract_agent_name(html, soup):
+    paths = [
+        ["props", "pageProps", "pageData", "data", "listingData", "agent", "name"],
+        ["props", "pageProps", "pageData", "data", "listingData", "agentName"],
+        ["props", "pageProps", "pageData", "data", "contactAgentData", "contactAgentCard", "agentInfoProps", "agent", "name"],
+        ["props", "pageProps", "pageData", "data", "contactAgentData", "contactAgentStickyBar", "agentInfoProps", "agent", "name"],
+        ["props", "pageProps", "pageData", "data", "contactAgentData", "contactAgentSheet", "agentInfoProps", "agent", "name"],
+        ["props", "pageProps", "pageData", "data", "enquiryModalData", "agent", "name"],
+        ["props", "pageProps", "pageData", "data", "listersInfo", 0, "listerName"],
+        ["pageProps", "pageData", "data", "listingData", "agent", "name"],
+        ["pageProps", "pageData", "data", "listingData", "agentName"],
+        ["pageProps", "pageData", "data", "contactAgentData", "contactAgentCard", "agentInfoProps", "agent", "name"],
+        ["pageProps", "pageData", "data", "contactAgentData", "contactAgentStickyBar", "agentInfoProps", "agent", "name"],
+        ["pageProps", "pageData", "data", "listersInfo", 0, "listerName"],
+        ["pageData", "data", "listingData", "agent", "name"],
+        ["pageData", "data", "listingData", "agentName"],
+        ["pageData", "data", "listersInfo", 0, "listerName"],
+        ["listingData", "agent", "name"],
+        ["listingData", "agentName"],
+        ["listingData", "listerName"],
+        ["contactAgentData", "contactAgentCard", "agentInfoProps", "agent", "name"],
+        ["contactAgentData", "contactAgentStickyBar", "agentInfoProps", "agent", "name"],
+        ["enquiryModalData", "agent", "name"],
+        ["listersInfo", 0, "listerName"],
+        ["lister", "name"],
+        ["agent", "name"],
+    ]
+
+    for root in _collect_all_json(soup):
+        for path in paths:
+            val = jget(root, path)
+            if not _is_blank(val):
+                return str(val).strip()
+        agents = jget(root, ["agents"])
+        if isinstance(agents, list):
+            for ag in agents:
+                name = ag.get("name")
+                if not _is_blank(name):
+                    return str(name).strip()
+        listers = jget(root, ["listersInfo"])
+        if isinstance(listers, list):
+            for info in listers:
+                if isinstance(info, dict):
+                    name = info.get("listerName") or info.get("name")
+                    if not _is_blank(name):
+                        return str(name).strip()
+
+    for sel in [
+        '[da-id="agent-name"]',
+        '[data-automation-id="agent-name"]',
+        '.agent-info__name',
+        '.agent-profile__name',
+        '.contact-agent-card__agent-name',
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            txt = el.get_text(" ", strip=True)
+            if not _is_blank(txt):
+                return txt
+
+    m = re.search(r'"(?:agentName|listerName)"\s*:\s*"([^"]+)"', html, re.I)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+def extract_lister_id(html, soup):
+    PRIORITY = {
+        "listerId": 5,
+        "lister.id": 5,
+        "listersInfo.listerId": 5,
+        "agentId": 4,
+        "agent.id": 3,
+        "contactAgent.agent.id": 3,
+        "regex:listerId": 2,
+        "regex:agentId": 1,
+    }
+    candidates = []
+    seen = set()
+
+    def add_candidate(val, source):
+        if _is_blank(val):
+            return
+        s = str(val).strip()
+        if not s:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        digits = sum(c.isdigit() for c in s)
+        is_numeric = 1 if s.isdigit() else 0
+        priority = PRIORITY.get(source, 0)
+        candidates.append((priority, is_numeric, digits, len(s), s))
+
+    def walk(obj):
+        visited = set()
+
+        def _walk(node):
+            oid = id(node)
+            if oid in visited:
+                return
+            visited.add(oid)
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    lk = str(k).lower()
+                    if lk in {"listerid", "lister_id"}:
+                        add_candidate(v, "listerId")
+                    if lk in {"agentid", "agent_id"}:
+                        add_candidate(v, "agentId")
+                    if lk == "agent" and isinstance(v, dict):
+                        add_candidate(v.get("id"), "agent.id")
+                    if lk == "lister" and isinstance(v, dict):
+                        add_candidate(v.get("id"), "lister.id")
+                    if isinstance(v, (dict, list)):
+                        _walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(obj)
+
+    for root in _collect_all_json(soup):
+        for path, src in [
+            (["listingData", "listerId"], "listerId"),
+            (["listingData", "agentId"], "agentId"),
+            (["listingData", "agent", "id"], "agent.id"),
+            (["contactAgentData", "contactAgentCard", "agentInfoProps", "agent", "id"], "contactAgent.agent.id"),
+            (["contactAgentData", "contactAgentStickyBar", "agentInfoProps", "agent", "id"], "contactAgent.agent.id"),
+            (["contactAgentData", "contactAgentSheet", "agentInfoProps", "agent", "id"], "contactAgent.agent.id"),
+            (["enquiryModalData", "agent", "id"], "agent.id"),
+            (["listersInfo", 0, "listerId"], "listersInfo.listerId"),
+            (["lister", "id"], "lister.id"),
+            (["agent", "id"], "agent.id"),
+        ]:
+            val = jget(root, path)
+            if not _is_blank(val):
+                add_candidate(val, src)
+        walk(root)
+
+    for key in ("listerId", "agentId"):
+        for match in re.finditer(rf'"{key}"\s*:\s*"?([0-9A-Za-z_-]+)"?', html, re.I):
+            add_candidate(match.group(1), f"regex:{key}")
+
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][4]
+    return ""
 
 def extract_agency_name(soup):
     for root in _collect_all_json(soup):
@@ -853,6 +1180,8 @@ def run():
         bed_n, bath_n, bed_raw, bath_raw = extract_bed_bath(html, soup)
         car_park, car_park_raw, car_park_list = extract_car_park(html, soup)
         lister_phone_raw, lister_phone_digits = extract_lister_phone(soup)
+        agent_name = extract_agent_name(html, soup)
+        lister_id = extract_lister_id(html, soup)
         agency_name = extract_agency_name(soup)
         agency_id, agency_id_source = extract_agency_id(soup)
         furnishing, furnishing_raw = extract_furnishing(html, soup)
@@ -863,6 +1192,18 @@ def run():
         amenities = extract_amenities(soup, html)
         bumi_lot, bumi_lot_raw_list = extract_bumi_lot(html, soup)
         bumi_lot_raw = " | ".join(bumi_lot_raw_list) if bumi_lot_raw_list else ""
+        land_area_val, land_area_unit, land_area_raw_list = extract_land_area(html, soup)
+        land_area_unit = land_area_unit or ""
+        if isinstance(land_area_val, (int, float)):
+            land_area_value = float(land_area_val)
+            land_area_str = (
+                str(int(land_area_value))
+                if land_area_value.is_integer()
+                else (f"{land_area_value:.2f}".rstrip("0").rstrip("."))
+            )
+        else:
+            land_area_str = ""
+        land_area_raw = " | ".join(land_area_raw_list) if land_area_raw_list else ""
 
         rows.append({
             "file": name,
@@ -877,9 +1218,11 @@ def run():
             "car_park_raw_list": " | ".join(car_park_list) if car_park_list else "",
             "lister_phone_raw": lister_phone_raw,
             "lister_phone_digits": lister_phone_digits,
+            "agent_name": agent_name,
             "agency_name": agency_name,
             "agency_id": agency_id,
             "agency_id_source": agency_id_source,
+            "lister_id": lister_id,
             "furnishing": furnishing,
             "furnishing_raw": furnishing_raw,
             "address": address,
@@ -889,6 +1232,9 @@ def run():
             "amenities": "; ".join(amenities) if amenities else "",
             "bumi_lot": bumi_lot,
             "bumi_lot_raw": bumi_lot_raw,
+            "land_area": land_area_str,
+            "land_area_unit": land_area_unit,
+            "land_area_raw": land_area_raw,
             "built_up": built_up_str,
             "built_up_psf": (f"{psf:.2f}" if isinstance(psf, (int, float)) else ""),
         })
@@ -901,12 +1247,15 @@ def run():
             "bedroom","bathroom","bedroom_raw","bathroom_raw",
             "car_park","car_park_raw","car_park_raw_list",
             "lister_phone_raw","lister_phone_digits",
+            "agent_name",
             "agency_name","agency_id","agency_id_source",
+            "lister_id",
             "furnishing","furnishing_raw",
             "address","address_source",
             "lister_url","license",
             "amenities",
             "bumi_lot","bumi_lot_raw",
+            "land_area","land_area_unit","land_area_raw",
             "built_up","built_up_psf",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
