@@ -665,6 +665,95 @@ def extract_amenities(soup, html):
             break
     return cleaned
 
+
+def extract_bumi_lot(html, soup):
+    flag = None
+    raw_hits = []
+    seen_raw = set()
+
+    def add_raw(text):
+        if not text:
+            return
+        cleaned = re.sub(r"\s+", " ", str(text)).strip()
+        key = cleaned.lower()
+        if cleaned and key not in seen_raw:
+            seen_raw.add(key)
+            raw_hits.append(cleaned)
+
+    def register(flag_val, raw_text=None):
+        nonlocal flag
+        if raw_text:
+            add_raw(raw_text)
+        if flag_val is True:
+            flag = True
+        elif flag_val is False and flag is None:
+            flag = False
+
+    def interpret_text(text):
+        t = (text or "").strip().lower()
+        if not t:
+            return None
+        if "bumi" in t and "lot" in t:
+            if any(x in t for x in ["non-bumi", "non bumi", "not bumi", "no bumi"]):
+                return False
+            return True
+        return None
+
+    def walk(obj, path=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                lk = str(k).lower()
+                new_path = f"{path}.{k}" if path else str(k)
+                if lk in {"bumilot", "isbumilot"}:
+                    if isinstance(v, bool):
+                        register(v, f"{new_path}={v}")
+                    elif isinstance(v, (int, float)):
+                        register(bool(v), f"{new_path}={v}")
+                    elif isinstance(v, str):
+                        guess = interpret_text(v)
+                        register(guess, f"{new_path}={v}")
+                    else:
+                        add_raw(f"{new_path}={v}")
+                if isinstance(v, (dict, list)):
+                    walk(v, new_path)
+                else:
+                    if isinstance(v, str):
+                        guess = interpret_text(v)
+                        if guess is not None:
+                            register(guess, v)
+                        elif "bumi" in v.lower() and "lot" in v.lower():
+                            add_raw(v)
+        elif isinstance(obj, list):
+            for idx, item in enumerate(obj):
+                walk(item, f"{path}[{idx}]")
+
+    for root in _collect_all_json(soup):
+        walk(root)
+        if flag is True:
+            break
+
+    if flag is None:
+        selectors = [
+            ".meta-table__item",
+            ".meta-table__item__wrapper",
+            ".meta-table__item__wrapper__value",
+            "[class*='chip']",
+            "[da-id='feature-chip']",
+            "[da-id='feature-chips'] span",
+        ]
+        for node in soup.select(", ".join(selectors)):
+            txt = node.get_text(" ", strip=True)
+            if not txt:
+                continue
+            guess = interpret_text(txt)
+            if guess is not None:
+                register(guess, txt)
+            elif "bumi" in txt.lower() and "lot" in txt.lower():
+                add_raw(txt)
+
+    flag_str = "Yes" if flag is True else ("No" if flag is False else "")
+    return flag_str, raw_hits
+
 def _scan_label_items(obj, label_name):
     out = []
     if isinstance(obj, dict):
@@ -772,6 +861,8 @@ def run():
         dom_text = extract_license_visible_text(soup)
         license_no = extract_license_ren(soup, dom_text)
         amenities = extract_amenities(soup, html)
+        bumi_lot, bumi_lot_raw_list = extract_bumi_lot(html, soup)
+        bumi_lot_raw = " | ".join(bumi_lot_raw_list) if bumi_lot_raw_list else ""
 
         rows.append({
             "file": name,
@@ -796,6 +887,8 @@ def run():
             "lister_url": lister_url,
             "license": license_no,
             "amenities": "; ".join(amenities) if amenities else "",
+            "bumi_lot": bumi_lot,
+            "bumi_lot_raw": bumi_lot_raw,
             "built_up": built_up_str,
             "built_up_psf": (f"{psf:.2f}" if isinstance(psf, (int, float)) else ""),
         })
@@ -813,6 +906,7 @@ def run():
             "address","address_source",
             "lister_url","license",
             "amenities",
+            "bumi_lot","bumi_lot_raw",
             "built_up","built_up_psf",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
