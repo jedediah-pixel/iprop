@@ -1218,51 +1218,114 @@ def extract_license_ren(soup, dom_text):
         return f"REN {m.group(1)}"
     return ""
 
+def _iter_facility_texts(node):
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, str):
+            t = cur.strip()
+            if t:
+                yield t
+        elif isinstance(cur, list):
+            for item in reversed(cur):
+                stack.append(item)
+        elif isinstance(cur, dict):
+            for key in ("text", "value", "valueText", "name", "label"):
+                val = cur.get(key)
+                if isinstance(val, str):
+                    t = val.strip()
+                    if t:
+                        yield t
+            for key in (
+                "data",
+                "items",
+                "facilities",
+                "amenities",
+                "list",
+                "values",
+                "options",
+                "chips",
+                "tags",
+            ):
+                child = cur.get(key)
+                if child:
+                    stack.append(child)
+
+
+def _gather_facilities_from_dom(container):
+    texts = []
+    if not container:
+        return texts
+    for chip in container.find_all(["li", "span", "a", "div", "p"], recursive=True):
+        t = chip.get_text(" ", strip=True)
+        if t:
+            texts.append(t)
+    return texts
+
+
 def extract_amenities(soup, html):
     result = []
+
     for root in _collect_all_json(soup):
-        for p in [
+        for path in [
             ["props", "pageProps", "pageData", "data", "amenitiesData"],
             ["pageProps", "pageData", "data", "amenitiesData"],
             ["props", "pageProps", "pageData", "data", "facilitiesData"],
         ]:
-            arr = jget(root, p)
-            if isinstance(arr, list):
-                for it in arr:
-                    cand = (it.get("text") or it.get("value") or it.get("valueText") or it.get("name") or it.get("label") or "").strip()
-                    if cand:
-                        result.append(cand)
+            node = jget(root, path)
+            if isinstance(node, (list, dict)):
+                for text_val in _iter_facility_texts(node):
+                    result.append(text_val)
+
         for key in ("Facilities", "Amenities"):
             items = _scan_label_items(root, key)
             for cand in items:
                 result.append(cand)
+
         for key in ("facilities", "amenities"):
             arr = jget(root, [key])
-            if isinstance(arr, list):
-                for it in arr:
-                    if isinstance(it, str):
-                        result.append(it.strip())
-                    elif isinstance(it, dict):
-                        cand = (it.get("text") or it.get("value") or it.get("valueText") or it.get("name") or it.get("label") or "").strip()
-                        if cand:
-                            result.append(cand)
+            if isinstance(arr, (list, dict)):
+                for text_val in _iter_facility_texts(arr):
+                    result.append(text_val)
+
     if not result:
-        for htxt in ("Facilities", "Amenities"):
-            hdr = soup.find(lambda tag: tag.name in ("h2", "h3", "h4") and (tag.get_text(strip=True) == htxt))
-            if hdr:
+        dom_targets = []
+        selectors = [
+            '[data-automation-id="property-facilities-section"]',
+            '[data-automation-id="property-amenities-section"]',
+            '[da-id="property-facilities-section"]',
+            '[da-id="property-amenities-section"]',
+            '.property-facilities-section',
+            '.property-amenities-section',
+            '#property-facilities-section',
+            '#property-amenities-section',
+        ]
+        for sel in selectors:
+            dom_targets.extend(soup.select(sel))
+
+        if dom_targets:
+            for container in dom_targets:
+                result.extend(_gather_facilities_from_dom(container))
+        else:
+            for htxt in ("Facilities", "Amenities"):
+                hdr = soup.find(
+                    lambda tag: tag.name in ("h2", "h3", "h4")
+                    and tag.get_text(strip=True) == htxt
+                )
+                if not hdr:
+                    continue
                 sib = hdr.find_next_sibling()
                 while sib and sib.name not in ("h2", "h3", "h4"):
-                    for chip in sib.find_all(["li", "span", "div"], recursive=True):
-                        t = chip.get_text(" ", strip=True)
-                        if t:
-                            result.append(t)
+                    result.extend(_gather_facilities_from_dom(sib))
                     sib = sib.find_next_sibling()
+
     cleaned = []
     seen = set()
     DROP_RE = re.compile(r"\b(psf|floor|built|tenure|title)\b", re.I)
+    SKIP_RE = re.compile(r"\b(see all|common facilities)\b", re.I)
     for x in result:
         t = re.sub(r"\s+", " ", x).strip()
-        if not t or DROP_RE.search(t):
+        if not t or DROP_RE.search(t) or SKIP_RE.search(t):
             continue
         key = t.lower()
         if key not in seen:
