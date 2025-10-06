@@ -1629,6 +1629,23 @@ def _normalize_address(s):
     return s
 
 
+def _normalize_location_text(value):
+    """Return a cleaned location string suitable for comparisons."""
+
+    if _is_blank(value):
+        return ""
+
+    text = _normalize_spaces(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"\s*\|\s*", " | ", text)
+    text = text.strip(" ,-|•")
+    text = text.replace("&amp;", "&")
+    return text
+
+
 def extract_state_district(soup):
     state_candidates = []
     district_candidates = []
