@@ -747,8 +747,33 @@ def extract_posted_datetime(soup):
             continue
         if not txt.lower().startswith("listed on"):
             continue
-        m = re.search(r"listed on\s*(.*)", txt, re.I)
-        if not m:
+        dt, _ = _parse_datetime_candidate(unix_ts)
+        posted_date, posted_time, source = finalize(dt, True, "json:lastPosted.unix")
+        if posted_date:
+            return posted_date, posted_time, source
+
+    # 2. JSON-LD RealEstateListing.datePosted (date only)
+    for obj in extract_ld_objects(soup, "RealEstateListing"):
+        date_obj = _parse_date_value(obj.get("datePosted"))
+        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+            dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+            posted_date, posted_time, source = finalize(dt, False, "jsonld:datePosted")
+            if posted_date:
+                return posted_date, posted_time, source
+
+    # 3. Property details metatable (date only, structured JSON payload)
+    for root in json_roots:
+        meta_items = None
+        for path in (
+            ["detailsData", "metatable", "items"],
+            ["detailsData", "metaTable", "items"],
+            ["metatable", "items"],
+            ["metaTable", "items"],
+        ):
+            meta_items = jget(root, path)
+            if meta_items:
+                break
+        if not isinstance(meta_items, list):
             continue
         date_obj = _parse_date_value(m.group(1))
         if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
