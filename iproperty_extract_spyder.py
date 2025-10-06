@@ -1607,7 +1607,7 @@ def extract_full_address(soup):
             return _normalize_address(str(v).strip()), "state.fullAddress"
     for o in extract_ld_objects(soup, "RealEstateListing"):
         try:
-            street = jget(o, ["spatialCoverage", "address", "streetAddress"])
+            street = jget(o, ["spatialCoverage", "location", "streetAddress"])
             if not _is_blank(street):
                 return _normalize_address(str(street).strip()), "jsonld.streetAddress"
         except Exception:
@@ -2044,28 +2044,28 @@ def run():
             "listing_date": listing_date,
             "listing_date_source": listing_date_source,
             "tenure": tenure,
-            "bedroom": bed_n or "",
-            "bathroom": bath_n or "",
+            "rooms": bed_n or "",
+            "toilets": bath_n or "",
             "bedroom_raw": bed_raw or "",
             "bathroom_raw": bath_raw or "",
             "car_park": car_park or "",
             "car_park_raw": car_park_raw or "",
             "car_park_raw_list": " | ".join(car_park_list) if car_park_list else "",
             "lister_phone_raw": lister_phone_raw,
-            "lister_phone_digits": lister_phone_digits,
+            "phone": lister_phone_digits,
             "agent_name": agent_name,
             "agent_name_source": agent_name_source,
-            "agency_name": agency_name,
+            "agency": agency_name,
             "agency_id": agency_id,
             "agency_id_source": agency_id_source,
             "lister_id": lister_id,
             "lister_id_source": lister_id_source,
             "furnishing": furnishing,
             "furnishing_raw": furnishing_raw,
-            "address": address,
-            "address_source": address_source,
+            "location": address,
+            "location_source": address_source,
             "lister_url": lister_url,
-            "license": license_no,
+            "REN": license_no,
             "amenities": "; ".join(amenities) if amenities else "",
             "bumi_lot": bumi_lot,
             "bumi_lot_raw": bumi_lot_raw,
@@ -2088,15 +2088,15 @@ def run():
             "price_currency","price","price_source",
             "listing_date","listing_date_source",
             "tenure",
-            "bedroom","bathroom","bedroom_raw","bathroom_raw",
+            "rooms","toilets","bedroom_raw","bathroom_raw",
             "car_park","car_park_raw","car_park_raw_list",
-            "lister_phone_raw","lister_phone_digits",
+            "lister_phone_raw","phone",
             "agent_name","agent_name_source",
-            "agency_name","agency_id","agency_id_source",
+            "agency","agency_id","agency_id_source",
             "lister_id","lister_id_source",
             "furnishing","furnishing_raw",
-            "address","address_source",
-            "lister_url","license",
+            "location","location_source",
+            "lister_url","REN",
             "amenities",
             "bumi_lot","bumi_lot_raw",
             "land_size","land_psf","land_raw","land_source","land_psf_source",
@@ -2111,7 +2111,7 @@ def run():
     if rows:
         print('--- Preview (first 5 rows) ---')
         for r in rows[:5]:
-            print({k: r[k] for k in ['file','tenure','bedroom','bathroom','built_up','built_up_psf','license']})
+            print({k: r[k] for k in ['file','tenure','rooms','toilets','built_up','built_up_psf','REN']})
 
 if __name__ == "__main__":
     run()
