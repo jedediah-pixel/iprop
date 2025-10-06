@@ -187,6 +187,17 @@ def _first_non_empty(*candidates):
                 return c
     return None
 
+
+def _normalize_inline_text(value):
+    if value is None:
+        return ""
+    text = str(value)
+    text = unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
 MY_TZ = timezone(timedelta(hours=8))
 SHORT_TITLE_FORBIDDEN_RE = re.compile(r"\b(for sale|for rent|psf|iproperty)\b", re.I)
 SHORT_TITLE_BY_RE = re.compile(r"\bby\b", re.I)
@@ -646,6 +657,24 @@ def extract_long_title(soup, short_title):
         return cleaned, src, ",".join([r for r in suspect_reason if r])
 
     return "", "", ""
+
+
+def extract_description_title(soup):
+    node = soup.select_one(".description-block-root h3.subtitle")
+    if node:
+        candidate = _normalize_inline_text(node.get_text(" ", strip=True))
+        if candidate:
+            return candidate
+
+    for root in _collect_all_json(soup):
+        raw_value = jget(root, ["descriptionBlockData", "subtitle"])
+        if isinstance(raw_value, (list, tuple)):
+            raw_value = _first_non_empty(*raw_value)
+        candidate = _normalize_inline_text(raw_value)
+        if candidate:
+            return candidate
+
+    return ""
 
 
 def extract_listing_date(soup):
@@ -2188,6 +2217,7 @@ def run():
             b_unit,
         )
         land_raw = " | ".join(land_raw_list) if land_raw_list else ""
+        description_title = extract_description_title(soup)
 
         if price_value is not None:
             if abs(price_value - round(price_value)) < 1e-6:
@@ -2205,6 +2235,7 @@ def run():
             "long_title": long_title,
             "long_title_source": long_title_source,
             "long_title_suspect": long_title_suspect,
+            "title": description_title,
             "price_currency": price_currency or ("MYR" if price_value else ""),
             "price": price_str,
             "price_source": price_source,
@@ -2252,6 +2283,7 @@ def run():
             "file","url",
             "short_title","short_title_source",
             "long_title","long_title_source","long_title_suspect",
+            "title",
             "price_currency","price","price_source",
             "listing_date","listing_date_source",
             "tenure",
