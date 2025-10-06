@@ -739,28 +739,8 @@ def extract_posted_datetime(soup):
         return dt_local.date().isoformat(), time_str, source
 
     midnight = datetime.min.time()
-    json_roots = list(_collect_all_json(soup))
 
-    # 1. listingData.lastPosted.unix (epoch seconds with time component)
-    for root in json_roots:
-        unix_ts = jget(root, ["listingData", "lastPosted", "unix"])
-        if unix_ts in (None, "", 0):
-            continue
-        dt, _ = _parse_datetime_candidate(unix_ts)
-        posted_date, posted_time, source = finalize(dt, True, "json:lastPosted.unix")
-        if posted_date:
-            return posted_date, posted_time, source
-
-    # 2. JSON-LD RealEstateListing.datePosted (date only)
-    for obj in extract_ld_objects(soup, "RealEstateListing"):
-        date_obj = _parse_date_value(obj.get("datePosted"))
-        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
-            dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
-            posted_date, posted_time, source = finalize(dt, False, "jsonld:datePosted")
-            if posted_date:
-                return posted_date, posted_time, source
-
-    # 3. DOM metatable "Listed on" (date only)
+    # 1. DOM metatable "Listed on"
     for node in soup.select('[da-id="metatable-item"], .meta-table__item__wrapper__value'):
         txt = node.get_text(" ", strip=True)
         if not txt:
@@ -773,9 +753,69 @@ def extract_posted_datetime(soup):
         date_obj = _parse_date_value(m.group(1))
         if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
             dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
-            posted_date, posted_time, source = finalize(dt, False, "dom:listedon")
+            posted_date, posted_time, source = finalize(dt, False, "dom:liston")
             if posted_date:
                 return posted_date, posted_time, source
+
+    # 2. JSON lastPosted.date
+    for root in _collect_all_json(soup):
+        last_posted = jget(root, ["listingData", "lastPosted", "date"])
+        if not last_posted:
+            continue
+        dt, has_time = _parse_datetime_candidate(last_posted)
+        posted_date, posted_time, source = finalize(dt, has_time, "json:lastPosted.date")
+        if posted_date:
+            return posted_date, posted_time, source
+
+    # 3. JSON lastPosted.unix
+    for root in _collect_all_json(soup):
+        unix_ts = jget(root, ["listingData", "lastPosted", "unix"])
+        if not unix_ts:
+            continue
+        dt, has_time = _parse_datetime_candidate(unix_ts)
+        posted_date, posted_time, source = finalize(dt, has_time, "json:lastPosted.unix")
+        if posted_date:
+            return posted_date, posted_time, source
+
+    # 4. JSON datePosted / postedAt (most recent)
+    candidates = []
+    for root in _collect_all_json(soup):
+        for key in ("datePosted", "postedAt"):
+            for path in ([key], ["listingData", key], ["listingDetail", key]):
+                val = jget(root, path)
+                if not val:
+                    continue
+                iterable = val if isinstance(val, list) else [val]
+                for item in iterable:
+                    dt, has_time = _parse_datetime_candidate(item)
+                    if dt and valid_dt(dt):
+                        candidates.append((_ensure_my_datetime(dt), has_time))
+                        continue
+                    date_obj = _parse_date_value(item)
+                    if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                        dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+                        candidates.append((dt, False))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        dt, has_time = candidates[-1]
+        posted_date, posted_time, source = finalize(dt, has_time, "json:datePosted")
+        if posted_date:
+            return posted_date, posted_time, source
+
+    # 5. JSON-LD datePublished
+    for o in extract_ld_objects(soup, "RealEstateListing"):
+        dt, has_time = _parse_datetime_candidate(o.get("datePublished"))
+        if dt and valid_dt(dt):
+            posted_date, posted_time, source = finalize(dt, has_time, "jsonld:datePublished")
+            if posted_date:
+                return posted_date, posted_time, source
+        else:
+            date_obj = _parse_date_value(o.get("datePublished"))
+            if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+                posted_date, posted_time, source = finalize(dt, False, "jsonld:datePublished")
+                if posted_date:
+                    return posted_date, posted_time, source
 
     return "", "", ""
 
@@ -2279,10 +2319,10 @@ def run():
             "title": description_title,
             "price_currency": price_currency or ("MYR" if price_value else ""),
             "price": price_str,
-            # "price_source": price_source,
+            "price_source": price_source,
             "posted_date": posted_date,
             "posted_time": posted_time,
-            # "posted_date_source": posted_date_source,
+            "posted_date_source": posted_date_source,
             "tenure": tenure,
             # "rooms": bed_n or "",
             # "toilets": bath_n or "",
@@ -2326,10 +2366,8 @@ def run():
             # "short_title","short_title_source",
             # "long_title","long_title_source","long_title_suspect",
             "title",
-            "price_currency","price",
-            # "price_source",
-            "posted_date","posted_time",
-            # "posted_date_source",
+            "price_currency","price","price_source",
+            "posted_date","posted_time","posted_date_source",
             "tenure",
             # "rooms","toilets",
             "bedroom_raw","bathroom_raw",
