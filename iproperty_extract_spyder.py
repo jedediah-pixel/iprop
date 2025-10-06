@@ -13,6 +13,7 @@ How to run in Spyder:
 """
 
 import os, re, json, csv, zipfile, gzip, sys
+from html import unescape
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
@@ -1627,6 +1628,154 @@ def _normalize_address(s):
     s = s.replace("&amp;", "&")
     return s
 
+
+def extract_state_district(soup):
+    state_candidates = []
+    district_candidates = []
+    state_seen = set()
+    district_seen = set()
+    state_order = 0
+    district_order = 0
+
+    def normalize_value(value):
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                norm = normalize_value(item)
+                if norm:
+                    return norm
+            return ""
+        if isinstance(value, dict):
+            for key in ("name", "text", "value", "label", "title"):
+                if key in value:
+                    norm = normalize_value(value.get(key))
+                    if norm:
+                        return norm
+            return ""
+        return _normalize_location_text(value)
+
+    def add_state(value, source, priority):
+        nonlocal state_order
+        norm = normalize_value(value)
+        if not norm:
+            return
+        key = norm.lower()
+        if key in state_seen:
+            return
+        state_seen.add(key)
+        state_order += 1
+        state_candidates.append({
+            "value": norm,
+            "source": source,
+            "priority": priority,
+            "order": state_order,
+        })
+
+    def add_district(value, source, priority):
+        nonlocal district_order
+        norm = normalize_value(value)
+        if not norm:
+            return
+        key = norm.lower()
+        if key in district_seen:
+            return
+        district_seen.add(key)
+        district_order += 1
+        district_candidates.append({
+            "value": norm,
+            "source": source,
+            "priority": priority,
+            "order": district_order,
+        })
+
+    breadcrumb_skip = {
+        "home",
+        "properties",
+        "property",
+        "property for sale",
+        "property for rent",
+        "for sale",
+        "for rent",
+        "new launches",
+        "commercial",
+        "residential",
+        "sale",
+        "rent",
+        "buy",
+        "rent property",
+        "malaysia",
+    }
+
+    for root in _collect_all_json(soup):
+        if isinstance(root, dict):
+            listing = root.get("listingData")
+            if isinstance(listing, dict):
+                add_state(listing.get("regionText"), "listingData.regionText", 6)
+                add_state(listing.get("region"), "listingData.region", 5)
+                add_state(listing.get("regionName"), "listingData.regionName", 5)
+                add_state(listing.get("regionLabel"), "listingData.regionLabel", 5)
+                add_district(listing.get("districtText"), "listingData.districtText", 6)
+                add_district(listing.get("district"), "listingData.district", 5)
+                add_district(listing.get("districtName"), "listingData.districtName", 5)
+                add_district(listing.get("districtLabel"), "listingData.districtLabel", 5)
+            detail = root.get("listingDetail")
+            if isinstance(detail, dict):
+                add_state(jget(detail, ["languagePlace", "level1"]), "listingDetail.languagePlace.level1", 4)
+                add_state(jget(detail, ["languagePlace", "level10"]), "listingDetail.languagePlace.level10", 4)
+                add_state(jget(detail, ["languagePlace", "state"]), "listingDetail.languagePlace.state", 4)
+                add_district(jget(detail, ["languagePlace", "level2"]), "listingDetail.languagePlace.level2", 4)
+                add_district(jget(detail, ["languagePlace", "level20"]), "listingDetail.languagePlace.level20", 4)
+                add_district(jget(detail, ["languagePlace", "district"]), "listingDetail.languagePlace.district", 4)
+            targeting = jget(root, ["dfpSlot", "targeting"]) or jget(root, ["targeting"])
+            if isinstance(targeting, dict):
+                add_state(targeting.get("State"), "targeting.State", 3)
+                add_district(targeting.get("District"), "targeting.District", 3)
+            if root.get("@type") == "RealEstateListing":
+                addr = root.get("address") or jget(root, ["spatialCoverage", "address"]) or {}
+                if isinstance(addr, dict):
+                    add_state(addr.get("addressRegion") or addr.get("addressRegionName"), "jsonld.addressRegion", 2)
+                    add_district(addr.get("addressLocality") or addr.get("addressLocalityName"), "jsonld.addressLocality", 2)
+            if root.get("@type") == "BreadcrumbList":
+                items = root.get("itemListElement") or []
+                loc_names = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = normalize_value(item.get("name"))
+                    if not name:
+                        continue
+                    if name.lower() in breadcrumb_skip:
+                        continue
+                    loc_names.append(name)
+                if loc_names:
+                    add_state(loc_names[0], "breadcrumb.ld", 1)
+                    if len(loc_names) > 1:
+                        add_district(loc_names[1], "breadcrumb.ld", 1)
+
+    crumb_links = soup.select('[da-id="breadcrumb-widget-item-link"]')
+    if crumb_links:
+        loc_names = []
+        for link in crumb_links:
+            txt = _normalize_location_text(link.get_text(" ", strip=True))
+            if not txt:
+                continue
+            if txt.lower() in breadcrumb_skip:
+                continue
+            loc_names.append(txt)
+        if loc_names:
+            add_state(loc_names[0], "breadcrumb.dom", 0)
+            if len(loc_names) > 1:
+                add_district(loc_names[1], "breadcrumb.dom", 0)
+
+    def pick_best(candidates):
+        if not candidates:
+            return "", ""
+        best = sorted(candidates, key=lambda c: (-c["priority"], c["order"]))[0]
+        return best["value"], best["source"]
+
+    state_val, state_source = pick_best(state_candidates)
+    district_val, district_source = pick_best(district_candidates)
+    return state_val, state_source, district_val, district_source
+
 def extract_lister_url(soup):
     a = soup.select_one('a[href*="/property-agent/"]')
     if a and a.get("href"):
@@ -2004,6 +2153,7 @@ def run():
         agency_name = extract_agency_name(soup)
         agency_id, agency_id_source = extract_agency_id(soup)
         furnishing, furnishing_raw = extract_furnishing(html, soup)
+        state, _state_source, district, _district_source = extract_state_district(soup)
         address, address_source = extract_full_address(soup)
         lister_url = extract_lister_url(soup)
         dom_text = extract_license_visible_text(soup)
