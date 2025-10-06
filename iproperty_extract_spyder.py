@@ -721,6 +721,7 @@ def extract_description_title(soup):
 
 def extract_posted_datetime(soup):
     today = datetime.now(MY_TZ).date()
+    json_roots = list(_collect_all_json(soup))
 
     def valid_dt(dt):
         if not dt:
@@ -747,8 +748,14 @@ def extract_posted_datetime(soup):
             continue
         if not txt.lower().startswith("listed on"):
             continue
-        dt, _ = _parse_datetime_candidate(unix_ts)
-        posted_date, posted_time, source = finalize(dt, True, "json:lastPosted.unix")
+        cleaned = re.sub(r"^listed on[:\s]*", "", txt, flags=re.I)
+        dt, has_time = _parse_datetime_candidate(cleaned)
+        if not dt:
+            date_obj = _parse_date_value(cleaned)
+            if date_obj:
+                dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+                has_time = False
+        posted_date, posted_time, source = finalize(dt, has_time, "dom:liston")
         if posted_date:
             return posted_date, posted_time, source
 
@@ -775,15 +782,32 @@ def extract_posted_datetime(soup):
                 break
         if not isinstance(meta_items, list):
             continue
-        date_obj = _parse_date_value(m.group(1))
-        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
-            dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
-            posted_date, posted_time, source = finalize(dt, False, "dom:liston")
+        for item in meta_items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or item.get("title") or item.get("name")
+            value = item.get("value") or item.get("valueText") or item.get("text")
+            if isinstance(value, dict):
+                value = value.get("value") or value.get("text")
+            if isinstance(value, (list, tuple)):
+                value = _first_non_empty(*value)
+            value_str = _normalize_spaces(value)
+            if not value_str:
+                continue
+            if label and "listed" not in str(label).lower():
+                continue
+            dt, has_time = _parse_datetime_candidate(value_str)
+            if not dt:
+                date_obj = _parse_date_value(value_str)
+                if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                    dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+                    has_time = False
+            posted_date, posted_time, source = finalize(dt, has_time, "json:metatable.listedOn")
             if posted_date:
                 return posted_date, posted_time, source
 
-    # 2. JSON lastPosted.date
-    for root in _collect_all_json(soup):
+    # 4. JSON lastPosted.date
+    for root in json_roots:
         last_posted = jget(root, ["listingData", "lastPosted", "date"])
         if not last_posted:
             continue
@@ -792,8 +816,8 @@ def extract_posted_datetime(soup):
         if posted_date:
             return posted_date, posted_time, source
 
-    # 3. JSON lastPosted.unix
-    for root in _collect_all_json(soup):
+    # 5. JSON lastPosted.unix
+    for root in json_roots:
         unix_ts = jget(root, ["listingData", "lastPosted", "unix"])
         if not unix_ts:
             continue
@@ -802,9 +826,9 @@ def extract_posted_datetime(soup):
         if posted_date:
             return posted_date, posted_time, source
 
-    # 4. JSON datePosted / postedAt (most recent)
+    # 6. JSON datePosted / postedAt (most recent)
     candidates = []
-    for root in _collect_all_json(soup):
+    for root in json_roots:
         for key in ("datePosted", "postedAt"):
             for path in ([key], ["listingData", key], ["listingDetail", key]):
                 val = jget(root, path)
@@ -827,7 +851,7 @@ def extract_posted_datetime(soup):
         if posted_date:
             return posted_date, posted_time, source
 
-    # 5. JSON-LD datePublished
+    # 7. JSON-LD datePublished
     for o in extract_ld_objects(soup, "RealEstateListing"):
         dt, has_time = _parse_datetime_candidate(o.get("datePublished"))
         if dt and valid_dt(dt):
