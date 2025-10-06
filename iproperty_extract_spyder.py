@@ -1724,17 +1724,85 @@ def extract_property_type(html, soup):
         ["listingData", "propertyTypeText"],
         ["listingData", "propertyTypeLocalizedText"],
         ["listingData", "propertyTypeGroup"],
+        ["listingData", "propertyTypeGroupText"],
+        ["listingData", "category"],
+        ["listingData", "categoryText"],
         ["propertyOverviewData", "propertyInfo", "propertyType"],
         ["propertyOverviewData", "propertyInfo", "propertyTypeText"],
+        ["listingDetail", "propertyType"],
+        ["listingDetail", "propertyTypeText"],
     ]
+    breadcrumb_candidates = []
+    breadcrumb_skip = {
+        "home",
+        "properties",
+        "property",
+        "property for sale",
+        "property for rent",
+        "for sale",
+        "for rent",
+        "new launches",
+        "commercial",
+        "residential",
+        "sale",
+        "rent",
+        "buy",
+        "rent property",
+        "malaysia",
+    }
+
+    def _add_breadcrumb_candidate(names):
+        filtered = [
+            (n or "").strip()
+            for n in names
+            if (n or "").strip() and (n or "").strip().lower() not in breadcrumb_skip
+        ]
+        if not filtered:
+            return
+        if len(filtered) >= 5:
+            breadcrumb_candidates.append(filtered[4])
+        else:
+            breadcrumb_candidates.append(filtered[-1])
+
     for root in _collect_all_json(soup):
         for path in paths:
             val = jget(root, path)
             if not _is_blank(val):
                 return str(val).strip()
+        if isinstance(root, dict):
+            cat = root.get("category") or root.get("propertyType")
+            if not _is_blank(cat):
+                return str(cat).strip()
+            if root.get("@type") == "BreadcrumbList":
+                items = root.get("itemListElement") or []
+                names = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    if _is_blank(name):
+                        itm = item.get("item") if isinstance(item.get("item"), dict) else None
+                        if itm:
+                            name = itm.get("name") or itm.get("title")
+                    if not _is_blank(name):
+                        names.append(_normalize_inline_text(name))
+                if names:
+                    _add_breadcrumb_candidate(names)
     m = re.search(r'"propertyType"\s*:\s*"([^"]+)"', html, re.I)
     if m:
         return m.group(1).strip()
+    if breadcrumb_candidates:
+        return _first_non_empty(*breadcrumb_candidates) or ""
+    crumb_links = soup.select('[da-id="breadcrumb-widget-item-link"]')
+    if crumb_links:
+        dom_names = [
+            _normalize_inline_text(link.get_text(" ", strip=True))
+            for link in crumb_links
+        ]
+        if dom_names:
+            _add_breadcrumb_candidate(dom_names)
+            if breadcrumb_candidates:
+                return _first_non_empty(*breadcrumb_candidates) or ""
     meta_root = soup.select_one('.meta-table-root[da-id="property-details"]')
     if meta_root:
         for item in meta_root.select('.meta-table__item'):
@@ -2789,31 +2857,32 @@ def run():
             price_str = ""
 
         rows.append({
-            "file": name,
+            # "file": name,
             "url": url,
+            "type": property_type,
             # "short_title": short_title,
             # "short_title_source": short_title_source,
             # "long_title": long_title,
             # "long_title_source": long_title_source,
             # "long_title_suspect": long_title_suspect,
             "title": description_title,
-            "price_currency": price_currency or ("MYR" if price_value else ""),
+            "currency": price_currency or ("MYR" if price_value else ""),
             "price": price_str,
-            "price_source": price_source,
+            # "price_source": price_source,
             "posted_date": posted_date,
             "posted_time": posted_time,
-            "posted_date_source": posted_date_source,
+            # "posted_date_source": posted_date_source,
             "tenure": tenure,
             # "rooms": bed_n or "",
             # "toilets": bath_n or "",
-            "bedroom_raw": bed_raw or "",
-            "bathroom_raw": bath_raw or "",
+            "rooms": bed_raw or "",
+            "toilets": bath_raw or "",
             "car_park": car_park or "",
             # "car_park_raw": car_park_raw or "",
-            "car_park_raw_list": " | ".join(car_park_list) if car_park_list else "",
-            "lister_phone_raw": lister_phone_raw,
+            # "car_park_raw_list": " | ".join(car_park_list) if car_park_list else "",
+            "phone": lister_phone_raw,
             # "phone": lister_phone_digits,
-            "agent_name": agent_name,
+            "lister": agent_name,
             # "agent_name_source": agent_name_source,
             "agency": agency_name,
             "agency_id": agency_id,
@@ -2823,16 +2892,18 @@ def run():
             "furnishing": furnishing,
             # "furnishing_raw": furnishing_raw,
             "location": address,
+            "region": state,
+            "subregion": district,
             # "location_source": address_source,
             "lister_url": lister_url,
-            "REN": license_no,
+            "ren": license_no,
             "amenities": "; ".join(amenities) if amenities else "",
             "bumi_lot": bumi_lot,
             # "bumi_lot_raw": bumi_lot_raw,
-            "land_size": land_size,
+            "land_area": land_size,
             "land_psf": land_psf,
             "land_raw": land_raw,
-            "land_source": land_source,
+            # "land_source": land_source,
             "land_psf_source": land_psf_source,
             "built_up": built_up_str,
             "built_up_psf": (f"{psf:.2f}" if isinstance(psf, (int, float)) else ""),
@@ -2842,21 +2913,25 @@ def run():
     out_csv = os.path.join(root, OUT_BASENAME)
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
-            "file","url",
+            # "file",
+            "url",
+            "type",
             # "short_title","short_title_source",
             # "long_title","long_title_source","long_title_suspect",
             "title",
-            "price_currency","price","price_source",
-            "posted_date","posted_time","posted_date_source",
+            "currency","price",
+            # "price_source",
+            "posted_date","posted_time",
+            # "posted_date_source",
             "tenure",
             # "rooms","toilets",
-            "bedroom_raw","bathroom_raw",
+            "rooms","toilets",
             "car_park",
             # "car_park_raw",
-            "car_park_raw_list",
-            "lister_phone_raw",
+            # "car_park_raw_list",
+            "phone",
             # "phone",
-            "agent_name",
+            "lister",
             # "agent_name_source",
             "agency","agency_id",
             # "agency_id_source",
@@ -2865,12 +2940,15 @@ def run():
             "furnishing",
             # "furnishing_raw",
             "location",
+            "region","subregion",
             # "location_source",
-            "lister_url","REN",
+            "lister_url","ren",
             "amenities",
             "bumi_lot",
             # "bumi_lot_raw",
-            "land_size","land_psf","land_raw","land_source","land_psf_source",
+            "land_area","land_psf","land_raw",
+            # "land_source",
+            "land_psf_source",
             "built_up","built_up_psf",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
