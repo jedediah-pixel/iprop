@@ -720,6 +720,329 @@ def extract_description_title(soup):
 
 
 def extract_posted_datetime(soup):
+    # --- timezone & helpers (keep your originals if they exist) ---
+    my_tz = globals().get("MY_TZ") or timezone(timedelta(hours=8))
+
+    ensure_my_datetime = globals().get("_ensure_my_datetime")
+    if ensure_my_datetime is None:
+        def ensure_my_datetime(dt):
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=my_tz)
+            return dt.astimezone(my_tz)
+
+    parse_datetime_value = globals().get("_parse_datetime_value")
+    if parse_datetime_value is None:
+        def parse_datetime_value(value):
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                try:
+                    dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+                except Exception:
+                    return None
+                return ensure_my_datetime(dt)
+            s = str(value).strip()
+            if not s:
+                return None
+            if re.fullmatch(r"\d{8}", s):
+                try:
+                    dt = datetime.strptime(s, "%Y%m%d")
+                    return ensure_my_datetime(dt)
+                except Exception:
+                    pass
+            iso_candidate = s.replace("Z", "+00:00")
+            for candidate in (iso_candidate, s):
+                try:
+                    dt = datetime.fromisoformat(candidate)
+                    return ensure_my_datetime(dt)
+                except Exception:
+                    continue
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d",
+                "%d %b %Y %H:%M:%S",
+                "%d %b %Y %H:%M",
+                "%d %b %Y",
+                "%d %B %Y %H:%M:%S",
+                "%d %B %Y %H:%M",
+                "%d %B %Y",
+                "%b %d, %Y %H:%M:%S",
+                "%b %d, %Y %H:%M",
+                "%b %d, %Y",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+                "%d/%m/%Y",
+            ):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    return ensure_my_datetime(dt)
+                except Exception:
+                    continue
+            return None
+
+    parse_datetime_candidate = globals().get("_parse_datetime_candidate")
+    if parse_datetime_candidate is None:
+        def parse_datetime_candidate(value):
+            dt = parse_datetime_value(value)
+            if not dt:
+                return None, False
+            has_time = False
+            if isinstance(value, (int, float)):
+                has_time = True
+            elif isinstance(value, str):
+                s = value.lower()
+                if (":" in s) or ("t" in s) or ("am" in s) or ("pm" in s):
+                    has_time = True
+            if has_time and dt.time() == datetime.min.time():
+                has_time = False
+            return dt, has_time
+
+    parse_date_value = globals().get("_parse_date_value")
+    if parse_date_value is None:
+        def parse_date_value(value):
+            dt = parse_datetime_value(value)
+            return dt.date() if dt else None
+
+    is_blank = globals().get("_is_blank")
+    if is_blank is None:
+        def is_blank(x):
+            return x is None or (str(x).strip() in {"", "-", "N/A", "n/a", "None"})
+
+    first_non_empty = globals().get("_first_non_empty")
+    if first_non_empty is None:
+        def first_non_empty(*candidates):
+            for c in candidates:
+                if isinstance(c, (list, tuple)):
+                    for item in c:
+                        if not is_blank(item):
+                            return item
+                else:
+                    if not is_blank(c):
+                        return c
+            return None
+
+    normalize_spaces = globals().get("_normalize_spaces")
+    if normalize_spaces is None:
+        def normalize_spaces(text):
+            return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    today = datetime.now(my_tz).date()
+    json_roots = list(_collect_all_json(soup))
+
+    def valid_dt(dt):
+        if not dt:
+            return False
+        dt_local = ensure_my_datetime(dt)
+        if not dt_local:
+            return False
+        date_part = dt_local.date()
+        return (date_part.year >= 2000) and (date_part <= today)
+
+    def finalize(dt, has_time, source):
+        if not valid_dt(dt):
+            return "", "", ""
+        dt_local = ensure_my_datetime(dt)
+        time_str = dt_local.strftime("%H:%M:%S") if has_time else ""
+        return dt_local.date().isoformat(), time_str, source
+
+    midnight = datetime.min.time()
+
+    # -------------------------
+    # PASS A: prefer signals WITH time
+    # -------------------------
+
+    # A1) JSON lastPosted.unix (epoch; always time)
+    for root in json_roots:
+        unix_ts = jget(root, ["listingData", "lastPosted", "unix"])
+        if unix_ts is None:
+            continue
+        dt, has_time = parse_datetime_candidate(unix_ts)
+        posted_date, posted_time, source = finalize(dt, has_time, "json:lastPosted.unix")
+        if posted_date and posted_time:
+            return posted_date, posted_time, source
+
+    # A2) JSON lastPosted.date (string with time)
+    for root in json_roots:
+        last_posted = jget(root, ["listingData", "lastPosted", "date"])
+        if not last_posted:
+            continue
+        dt, has_time = parse_datetime_candidate(last_posted)
+        posted_date, posted_time, source = finalize(dt, has_time, "json:lastPosted.date")
+        if posted_date and posted_time:
+            return posted_date, posted_time, source
+
+    # A3) Generic JSON datePosted/postedAt that include time → choose most recent
+    time_candidates = []
+    for root in json_roots:
+        for key in ("datePosted", "postedAt"):
+            for path in ([key], ["listingData", key], ["listingDetail", key]):
+                val = jget(root, path)
+                if not val:
+                    continue
+                iterable = val if isinstance(val, list) else [val]
+                for item in iterable:
+                    dt, has_time = parse_datetime_candidate(item)
+                    if has_time and valid_dt(dt):
+                        time_candidates.append(ensure_my_datetime(dt))
+    if time_candidates:
+        dt = max(time_candidates)
+        posted_date, posted_time, source = finalize(dt, True, "json:datePosted(time)")
+        if posted_date:
+            return posted_date, posted_time, source
+
+    # A4) JSON-LD RealEstateListing datePublished/datePosted with time
+    for obj in extract_ld_objects(soup, "RealEstateListing"):
+        for key in ("datePublished", "datePosted"):
+            val = obj.get(key)
+            if not val:
+                continue
+            dt, has_time = parse_datetime_candidate(val)
+            if has_time and valid_dt(dt):
+                posted_date, posted_time, source = finalize(dt, True, f"jsonld:{key}")
+                if posted_date:
+                    return posted_date, posted_time, source
+
+    # A5) DOM “Listed on …” with time (rare, but support it)
+    for node in soup.select('[da-id="metatable-item"], .meta-table__item__wrapper__value'):
+        txt = normalize_spaces(node.get_text(" ", strip=True))
+        if not txt or not txt.lower().startswith("listed on"):
+            continue
+        cleaned = re.sub(r"^listed on[:\s]*", "", txt, flags=re.I)
+        dt, has_time = parse_datetime_candidate(cleaned)
+        if has_time:
+            posted_date, posted_time, source = finalize(dt, True, "dom:liston")
+            if posted_date:
+                return posted_date, posted_time, source
+
+    # A6) Structured JSON payload metatable with time
+    for root in json_roots:
+        meta_items = None
+        for path in (
+            ["detailsData", "metatable", "items"],
+            ["detailsData", "metaTable", "items"],
+            ["metatable", "items"],
+            ["metaTable", "items"],
+        ):
+            meta_items = jget(root, path)
+            if meta_items:
+                break
+        if not isinstance(meta_items, list):
+            continue
+        for item in meta_items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or item.get("title") or item.get("name")
+            value = item.get("value") or item.get("valueText") or item.get("text")
+            if isinstance(value, dict):
+                value = value.get("value") or value.get("text")
+            if isinstance(value, (list, tuple)):
+                value = first_non_empty(*value)
+            value_str = normalize_spaces(value)
+            if not value_str:
+                continue
+            if label and "listed" not in str(label).lower():
+                continue
+            dt, has_time = parse_datetime_candidate(value_str)
+            if has_time:
+                posted_date, posted_time, source = finalize(dt, True, "json:metatable.listedOn")
+                if posted_date:
+                    return posted_date, posted_time, source
+
+    # -------------------------
+    # PASS B: fallbacks (date-only)
+    # -------------------------
+
+    # B1) JSON-LD RealEstateListing.datePosted (date-only)
+    for obj in extract_ld_objects(soup, "RealEstateListing"):
+        date_obj = parse_date_value(obj.get("datePosted"))
+        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+            dt = datetime.combine(date_obj, midnight, tzinfo=my_tz)
+            posted_date, posted_time, source = finalize(dt, False, "jsonld:datePosted")
+            if posted_date:
+                return posted_date, posted_time, source
+
+    # B2) Structured JSON payload metatable (date-only)
+    for root in json_roots:
+        meta_items = None
+        for path in (
+            ["detailsData", "metatable", "items"],
+            ["detailsData", "metaTable", "items"],
+            ["metatable", "items"],
+            ["metaTable", "items"],
+        ):
+            meta_items = jget(root, path)
+            if meta_items:
+                break
+        if not isinstance(meta_items, list):
+            continue
+        for item in meta_items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or item.get("title") or item.get("name")
+            value = item.get("value") or item.get("valueText") or item.get("text")
+            if isinstance(value, dict):
+                value = value.get("value") or value.get("text")
+            if isinstance(value, (list, tuple)):
+                value = first_non_empty(*value)
+            value_str = normalize_spaces(value)
+            if not value_str:
+                continue
+            if label and "listed" not in str(label).lower():
+                continue
+            date_obj = parse_date_value(value_str)
+            if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                dt = datetime.combine(date_obj, midnight, tzinfo=my_tz)
+                posted_date, posted_time, source = finalize(dt, False, "json:metatable.listedOn")
+                if posted_date:
+                    return posted_date, posted_time, source
+
+    # B3) DOM metatable “Listed on …” (date-only)
+    for node in soup.select('[da-id="metatable-item"], .meta-table__item__wrapper__value'):
+        txt = normalize_spaces(node.get_text(" ", strip=True))
+        if not txt or not txt.lower().startswith("listed on"):
+            continue
+        cleaned = re.sub(r"^listed on[:\s]*", "", txt, flags=re.I)
+        date_obj = parse_date_value(cleaned)
+        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+            dt = datetime.combine(date_obj, midnight, tzinfo=my_tz)
+            posted_date, posted_time, source = finalize(dt, False, "dom:liston")
+            if posted_date:
+                return posted_date, posted_time, source
+
+    # B4) Generic JSON datePosted/postedAt (date-only) → choose most recent
+    date_only_candidates = []
+    for root in json_roots:
+        for key in ("datePosted", "postedAt"):
+            for path in ([key], ["listingData", key], ["listingDetail", key]):
+                val = jget(root, path)
+                if not val:
+                    continue
+                iterable = val if isinstance(val, list) else [val]
+                for item in iterable:
+                    date_obj = parse_date_value(item)
+                    if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                        dt = datetime.combine(date_obj, midnight, tzinfo=my_tz)
+                        date_only_candidates.append(dt)
+    if date_only_candidates:
+        dt = max(date_only_candidates)
+        posted_date, posted_time, source = finalize(dt, False, "json:datePosted")
+        if posted_date:
+            return posted_date, posted_time, source
+
+    # B5) JSON-LD datePublished (date-only)
+    for obj in extract_ld_objects(soup, "RealEstateListing"):
+        date_obj = parse_date_value(obj.get("datePublished"))
+        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+            dt = datetime.combine(date_obj, midnight, tzinfo=my_tz)
+            posted_date, posted_time, source = finalize(dt, False, "jsonld:datePublished")
+            if posted_date:
+                return posted_date, posted_time, source
+
+    return "", "", ""
+
     my_tz = globals().get("MY_TZ") or timezone(timedelta(hours=8))
 
     ensure_my_datetime = globals().get("_ensure_my_datetime")
