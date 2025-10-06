@@ -13,6 +13,8 @@ How to run in Spyder:
 """
 
 import os, re, json, csv, zipfile, gzip, sys
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 # Try BeautifulSoup; if missing, print a clear hint.
 try:
@@ -184,6 +186,135 @@ def _first_non_empty(*candidates):
                 return c
     return None
 
+MY_TZ = timezone(timedelta(hours=8))
+SHORT_TITLE_FORBIDDEN_RE = re.compile(r"\b(for sale|for rent|psf|iproperty)\b", re.I)
+SHORT_TITLE_BY_RE = re.compile(r"\bby\b", re.I)
+SHORT_TITLE_RM_RE = re.compile(r"\brm\b", re.I)
+LONG_TRANS_RE = re.compile(r"\bfor\s+(sale|rent)\b", re.I)
+LONG_TYPE_RE = re.compile(
+    r"\b(Condominium|Apartment|Serviced Residence|Terrace|Semi-?D|Bungalow|Shop-?Office|Office|Land|Factory)\b",
+    re.I,
+)
+LONG_PRICE_RE = re.compile(r"RM\s*[0-9][0-9,\.]*", re.I)
+RENT_HINT_RE = re.compile(r"(/mo\b|/month\b|per\s+month|monthly)", re.I)
+HEAD_PRICE_RE = re.compile(r"RM\s*([0-9][0-9,\.]*)", re.I)
+DATE_WORD_RE = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})\b")
+
+def _normalize_spaces(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _clean_short_title(text):
+    s = _normalize_spaces(text)
+    s = s.strip(",-|•")
+    s = re.sub(r"\s*,\s*", ", ", s)
+    return s
+
+
+def _short_title_guard(text):
+    if not text:
+        return False
+    candidate = text.strip()
+    if not (8 <= len(candidate) <= 60):
+        return False
+    lower = candidate.lower()
+    if SHORT_TITLE_FORBIDDEN_RE.search(lower):
+        return False
+    if SHORT_TITLE_BY_RE.search(lower):
+        return False
+    if SHORT_TITLE_RM_RE.search(lower):
+        return False
+    parts = [p for p in re.split(r"\s*,\s*|\s+in\s+|\s+at\s+", candidate) if p]
+    if len(parts) > 3:
+        return False
+    return True
+
+
+def _title_from_slug(slug):
+    slug = slug.replace("-", " ")
+    slug = re.sub(r"\s+", " ", slug)
+    words = [w.capitalize() if w else "" for w in slug.split(" ")]
+    return " ".join(words).strip()
+
+
+def _parse_price_number(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = re.sub(r"[^0-9\.]+", "", str(value))
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _coerce_price_value(num):
+    if num is None:
+        return None
+    if abs(num - round(num)) < 1e-6:
+        return float(round(num))
+    return float(num)
+
+
+def _clean_long_title(text):
+    s = _normalize_spaces(text)
+    if not s:
+        return ""
+    s = re.sub(r"\s*[|\-]\s*iProperty\.com\.my\b", "", s, flags=re.I)
+    s = re.sub(r"\bby\s+[^|\-•]+", "", s, flags=re.I)
+    s = re.sub(r"\bREN\s*[:\-]?\s*\d+\b", "", s, flags=re.I)
+    s = re.sub(r"\bPEA\s*[:\-]?\s*\d+\b", "", s, flags=re.I)
+    s = re.sub(r"\bREA\s*[:\-]?\s*\d+\b", "", s, flags=re.I)
+    s = LONG_PRICE_RE.sub("", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip(" ,-|•")
+
+
+def _ensure_my_date(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=MY_TZ)
+    else:
+        dt = dt.astimezone(MY_TZ)
+    return dt.date()
+
+
+def _parse_date_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return _ensure_my_date(datetime.fromtimestamp(float(value), tz=timezone.utc))
+        except Exception:
+            return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{8}", s):
+        try:
+            dt = datetime.strptime(s, "%Y%m%d")
+            return _ensure_my_date(dt)
+        except Exception:
+            pass
+    iso_candidate = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso_candidate)
+        return _ensure_my_date(dt)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%d/%m/%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return _ensure_my_date(dt)
+        except Exception:
+            continue
+    return None
+
+
 # ------------------- FIELD EXTRACTORS -------------------
 REN_PAT = re.compile(r"\bREN[:\-]?\s*(\d{3,7})\b", re.I)
 
@@ -213,28 +344,369 @@ def extract_ld_objects(soup, at_type=None):
                     if (at_type is None) or (o.get("@type") == at_type):
                         yield o
 
-def extract_price(html, soup):
-    m = re.search(
-        r'"price"\s*:\s*{[^{}]*"currency"\s*:\s*"([A-Z]+)"[^{}]*?(?:"min"\s*:\s*([0-9,\.]+))?[^{}]*?(?:"max"\s*:\s*([0-9,\.]+))?',
-        html, re.S | re.I
-    )
-    if m:
-        p = _num(m.group(2)) if m.group(2) else _num(m.group(3))
-        return "MYR", p
+def extract_price(html, soup, is_rent):
+    candidates = []
+    order = 0
+
+    def add_candidate(amount, currency, source, priority, raw_text="", rent_hint=False):
+        nonlocal order
+        if amount is None:
+            return
+        currency = (currency or "").upper()
+        if currency == "RM":
+            currency = "MYR"
+        if currency and currency != "MYR":
+            return
+        value = _coerce_price_value(amount)
+        if value is None or value <= 0:
+            return
+        if is_rent:
+            if value > 100000:
+                return
+        else:
+            if value < 10000:
+                return
+        if raw_text and len(raw_text) > 64:
+            raw_text = raw_text[:64]
+        candidates.append(
+            {
+                "amount": value,
+                "currency": "MYR",
+                "source": source,
+                "priority": priority,
+                "rent_hint": bool(rent_hint),
+                "order": order,
+            }
+        )
+        order += 1
+
+    # 1. Flight/Next data
+    flight_found = False
+    for root in _collect_all_json(soup):
+        if flight_found:
+            break
+        price_obj = jget(root, ["listingDetail", "price"])
+        if isinstance(price_obj, dict):
+            currency = price_obj.get("currency") or price_obj.get("priceCurrency")
+            price_val = None
+            if price_obj.get("min"):
+                price_val = _parse_price_number(price_obj.get("min"))
+            if price_val is None and price_obj.get("max"):
+                price_val = _parse_price_number(price_obj.get("max"))
+            if price_val is None and price_obj.get("value"):
+                price_val = _parse_price_number(price_obj.get("value"))
+            if price_val is not None:
+                rent_hint = False
+                business = price_obj.get("businessFunction") or ""
+                if isinstance(business, str) and "lease" in business.lower():
+                    rent_hint = True
+                add_candidate(price_val, currency or "MYR", "flight.price", 4, rent_hint=rent_hint)
+                flight_found = True
+                break
+        listing_price = jget(root, ["listingData", "price"])
+        if listing_price is not None:
+            currency = jget(root, ["listingData", "priceCurrency"]) or ""
+            pretty = jget(root, ["listingData", "pricePretty"]) or ""
+            listing_type = str(jget(root, ["listingData", "listingType"]) or "")
+            rent_hint = bool(RENT_HINT_RE.search(pretty)) or listing_type.lower() == "rent"
+            add_candidate(_parse_price_number(listing_price), currency or pretty, "flight.price", 4, raw_text=pretty, rent_hint=rent_hint)
+            flight_found = True
+            break
+
+    # 2. JSON-LD offers
     for o in extract_ld_objects(soup, "RealEstateListing"):
         offers = o.get("offers") or {}
-        if "price" in offers:
-            return offers.get("priceCurrency") or "MYR", _num(offers.get("price"))
-    for node in soup.find_all(string=True):
-        if node.parent and node.parent.name in ("script", "style"):
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        price_val = offers.get("price")
+        currency = offers.get("priceCurrency") or offers.get("currency")
+        if price_val:
+            rent_hint = False
+            business = offers.get("businessFunction") or ""
+            if isinstance(business, str) and "lease" in business.lower():
+                rent_hint = True
+            add_candidate(_parse_price_number(price_val), currency, "jsonld.offers", 3, rent_hint=rent_hint)
+            break
+
+    # 3. DOM headline
+    dom_texts = []
+    selectors = [
+        '[da-id="price-amount"]',
+        '[data-automation-id="listing-price"]',
+        '[data-automation-id="price"]',
+        '.price-amount',
+        '.listing-price',
+    ]
+    seen_dom = set()
+    for sel in selectors:
+        for node in soup.select(sel):
+            txt = node.get_text(" ", strip=True)
+            if not txt:
+                continue
+            key = txt.lower()
+            if key in seen_dom:
+                continue
+            seen_dom.add(key)
+            dom_texts.append(txt)
+    # fallback to headline pretty price from JSON if not captured
+    if not dom_texts:
+        for root in _collect_all_json(soup):
+            pretty = jget(root, ["listingData", "pricePretty"])
+            if pretty:
+                dom_texts.append(str(pretty))
+                break
+
+    for txt in dom_texts:
+        if not txt:
             continue
-        t = (node or "").strip()
-        if not t or re.search(r"\bpsf|\bpsm|\bper\s+sq", t, re.I):
+        lower = txt.lower()
+        if any(term in lower for term in ["psf", "psm", "per sq", "sqft", "sqm"]):
             continue
-        mm = re.search(r"\bRM\s*([0-9][0-9,\.]*)\b", t, re.I)
-        if mm:
-            return "MYR", _num(mm.group(1))
-    return "", None
+        if "deposit" in lower or "booking" in lower:
+            continue
+        rent_hint = bool(RENT_HINT_RE.search(txt)) or ("for rent" in lower)
+        amounts = [
+            _parse_price_number(m.group(1))
+            for m in HEAD_PRICE_RE.finditer(txt)
+        ]
+        amounts = [a for a in amounts if a]
+        if not amounts:
+            continue
+        pick_amount = None
+        if is_rent:
+            # Prefer the first amount with rent hint context
+            pick_amount = amounts[0]
+        else:
+            pick_amount = max(amounts)
+        add_candidate(pick_amount, "MYR", "dom.rm", 2, raw_text=txt, rent_hint=rent_hint)
+
+    # 4. Head titles fallback
+    head_candidates = []
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        head_candidates.append((og.get("content"), "og"))
+    title_txt = soup.title.get_text() if soup.title else ""
+    if title_txt:
+        head_candidates.append((title_txt, "title"))
+    tw = soup.find("meta", attrs={"name": "twitter:title"})
+    if tw and tw.get("content"):
+        head_candidates.append((tw.get("content"), "twitter"))
+
+    for text_val, label in head_candidates:
+        if not text_val:
+            continue
+        cleaned = _normalize_spaces(text_val)
+        if not LONG_TRANS_RE.search(cleaned):
+            continue
+        if any(term in cleaned.lower() for term in ["psf", "psm", "per sq", "sqft", "sqm"]):
+            continue
+        mm = HEAD_PRICE_RE.search(cleaned)
+        if not mm:
+            continue
+        rent_hint = bool(RENT_HINT_RE.search(cleaned)) or ("for rent" in cleaned.lower())
+        add_candidate(_parse_price_number(mm.group(1)), "MYR", "head.title", 1, raw_text=cleaned, rent_hint=rent_hint)
+        break
+
+    if not candidates:
+        return "", None, ""
+
+    # Choose best candidate per priority respecting rent/sale heuristics
+    candidates.sort(key=lambda x: (-x["priority"], x["order"]))
+    grouped = {}
+    for c in candidates:
+        grouped.setdefault(c["priority"], []).append(c)
+    for priority in sorted(grouped.keys(), reverse=True):
+        group = grouped[priority]
+        if is_rent:
+            rent_group = [c for c in group if c["rent_hint"]]
+            if rent_group:
+                rent_group.sort(key=lambda x: (x["amount"], x["order"]))
+                best = rent_group[0]
+                return best["currency"], best["amount"], best["source"]
+        if not is_rent and priority == 2:
+            group.sort(key=lambda x: (-x["amount"], x["order"]))
+        else:
+            group.sort(key=lambda x: (x["order"]))
+        best = group[0]
+        return best["currency"], best["amount"], best["source"]
+
+    best = candidates[0]
+    return best["currency"], best["amount"], best["source"]
+
+
+def extract_short_title(soup, url):
+    # 1. JSON-LD RealEstateListing.name
+    for o in extract_ld_objects(soup, "RealEstateListing"):
+        name = o.get("name")
+        cleaned = _clean_short_title(name)
+        if _short_title_guard(cleaned):
+            return cleaned, "ld"
+
+    # 2. H1 text
+    h1_candidates = []
+    selectors = [
+        '[da-id="property-title"]',
+        '[data-automation-id="listing-title"]',
+        "h1",
+    ]
+    seen = set()
+    for sel in selectors:
+        for node in soup.select(sel):
+            txt = node.get_text(" ", strip=True)
+            if not txt:
+                continue
+            key = txt.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            h1_candidates.append(txt)
+    for txt in h1_candidates:
+        cleaned = _clean_short_title(txt)
+        if _short_title_guard(cleaned):
+            return cleaned, "h1"
+
+    # 3. URL fallback
+    candidate = ""
+    if url:
+        parsed = urlparse(url)
+        if parsed.netloc and "iproperty.com.my" in parsed.netloc:
+            segments = [seg for seg in parsed.path.split("/") if seg]
+            target_idx = None
+            for idx, seg in enumerate(segments):
+                if re.match(r"(sale|rent)(?:-|$)", seg):
+                    target_idx = idx
+                    break
+            if target_idx is not None:
+                slugs = []
+                j = target_idx - 1
+                while j >= 0 and len(slugs) < 2:
+                    slug = segments[j]
+                    if slug.lower().startswith("ol-sale-"):
+                        j -= 1
+                        continue
+                    if slug.lower() == "property" and len(slugs) == 0 and j > 0:
+                        j -= 1
+                        continue
+                    slugs.append(slug)
+                    j -= 1
+                slugs = list(reversed(slugs))
+                if slugs:
+                    parts = [_title_from_slug(s) for s in slugs if s]
+                    candidate = ", ".join([p for p in parts if p])
+    cleaned = _clean_short_title(candidate)
+    if _short_title_guard(cleaned):
+        return cleaned, "url"
+
+    return "", ""
+
+
+def extract_long_title(soup, short_title):
+    sources = []
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        sources.append((og.get("content"), "og"))
+    title_txt = soup.title.get_text() if soup.title else ""
+    if title_txt:
+        sources.append((title_txt, "title"))
+    tw = soup.find("meta", attrs={"name": "twitter:title"})
+    if tw and tw.get("content"):
+        sources.append((tw.get("content"), "twitter"))
+
+    fallback = None
+    fallback_reason = ""
+    for raw, src in sources:
+        cleaned = _clean_long_title(raw)
+        if not cleaned:
+            continue
+        length_ok = 20 <= len(cleaned) <= 140
+        has_trans = bool(LONG_TRANS_RE.search(cleaned))
+        has_type = bool(LONG_TYPE_RE.search(cleaned))
+        if not fallback and has_trans and length_ok:
+            fallback = (cleaned, src)
+            if not has_type:
+                fallback_reason = "missing_type"
+        if not length_ok or not has_trans:
+            continue
+        if not has_type:
+            if not fallback:
+                fallback = (cleaned, src)
+                fallback_reason = "missing_type"
+            continue
+        suspect_reason = []
+        if short_title and short_title.lower() not in cleaned.lower():
+            suspect_reason.append("short_mismatch")
+        return cleaned, src, ",".join(suspect_reason)
+
+    if fallback:
+        cleaned, src = fallback
+        suspect_reason = fallback_reason.split(",") if fallback_reason else []
+        if short_title and short_title.lower() not in cleaned.lower():
+            suspect_reason.append("short_mismatch")
+        return cleaned, src, ",".join([r for r in suspect_reason if r])
+
+    return "", "", ""
+
+
+def extract_listing_date(soup):
+    today = datetime.now(MY_TZ).date()
+
+    # 1. DOM metatable "Listed on"
+    for node in soup.select('[da-id="metatable-item"], .meta-table__item__wrapper__value'):
+        txt = node.get_text(" ", strip=True)
+        if not txt:
+            continue
+        if not txt.lower().startswith("listed on"):
+            continue
+        m = re.search(r"listed on\s*(.*)", txt, re.I)
+        if not m:
+            continue
+        date_obj = _parse_date_value(m.group(1))
+        if date_obj and date_obj.year >= 2000 and date_obj <= today:
+            return date_obj.isoformat(), "dom:liston"
+
+    # 2. JSON lastPosted.date
+    for root in _collect_all_json(soup):
+        last_posted = jget(root, ["listingData", "lastPosted", "date"])
+        if last_posted:
+            date_obj = _parse_date_value(last_posted)
+            if date_obj and date_obj.year >= 2000 and date_obj <= today:
+                return date_obj.isoformat(), "json:lastPosted.date"
+
+    # 3. JSON lastPosted.unix
+    for root in _collect_all_json(soup):
+        unix_ts = jget(root, ["listingData", "lastPosted", "unix"])
+        if unix_ts:
+            date_obj = _parse_date_value(unix_ts)
+            if date_obj and date_obj.year >= 2000 and date_obj <= today:
+                return date_obj.isoformat(), "json:lastPosted.unix"
+
+    # 4. JSON datePosted / postedAt (most recent)
+    date_candidates = []
+    for root in _collect_all_json(soup):
+        for key in ("datePosted", "postedAt"):
+            for path in ([key], ["listingData", key], ["listingDetail", key]):
+                val = jget(root, path)
+                if not val:
+                    continue
+                if isinstance(val, list):
+                    iterable = val
+                else:
+                    iterable = [val]
+                for item in iterable:
+                    date_obj = _parse_date_value(item)
+                    if date_obj and date_obj.year >= 2000 and date_obj <= today:
+                        date_candidates.append(date_obj)
+    if date_candidates:
+        latest = max(date_candidates)
+        return latest.isoformat(), "json:datePosted"
+
+    # 5. JSON-LD datePublished
+    for o in extract_ld_objects(soup, "RealEstateListing"):
+        date_obj = _parse_date_value(o.get("datePublished"))
+        if date_obj and date_obj.year >= 2000 and date_obj <= today:
+            return date_obj.isoformat(), "jsonld:datePublished"
+
+    return "", ""
 
 def is_rent_page(soup):
     for item in soup.select(".meta-table__item"):
@@ -1505,16 +1977,19 @@ def run():
         soup = BeautifulSoup(html, "html.parser")
 
         url = extract_url(html, soup) or ""
+        short_title, short_title_source = extract_short_title(soup, url)
+        long_title, long_title_source, long_title_suspect = extract_long_title(soup, short_title)
         listing_id = extract_listing_id(html, soup)
         property_type = extract_property_type(html, soup)
         rent = is_rent_page(soup)
-        _, price = extract_price(html, soup)
+        price_currency, price_value, price_source = extract_price(html, soup, rent)
+        listing_date, listing_date_source = extract_listing_date(soup)
         b_val, b_unit = extract_builtup(html, soup)
         psf = extract_builtup_psf(html, soup)
-        if psf is None and (not rent) and price and b_val:
+        if psf is None and (not rent) and price_value and b_val:
             area_sqft = _area_to_sqft(b_val, b_unit)
-            if area_sqft and 400 <= area_sqft <= 20000 and 10000 <= price <= 50000000:
-                psf = round(price / area_sqft, 2)
+            if area_sqft and 400 <= area_sqft <= 20000 and 10000 <= price_value <= 50000000:
+                psf = round(price_value / area_sqft, 2)
         if b_val:
             unit_str = "sq ft" if _is_sqft(b_unit) or (not b_unit) else ("sqm" if _is_sqm(b_unit) else str(b_unit))
             built_up_str = f"{int(b_val) if float(b_val).is_integer() else b_val} {unit_str}"
@@ -1540,16 +2015,34 @@ def run():
             html,
             soup,
             property_type,
-            price,
+            price_value,
             rent,
             b_val,
             b_unit,
         )
         land_raw = " | ".join(land_raw_list) if land_raw_list else ""
 
+        if price_value is not None:
+            if abs(price_value - round(price_value)) < 1e-6:
+                price_str = str(int(round(price_value)))
+            else:
+                price_str = f"{price_value:.2f}".rstrip("0").rstrip(".")
+        else:
+            price_str = ""
+
         rows.append({
             "file": name,
             "url": url,
+            "short_title": short_title,
+            "short_title_source": short_title_source,
+            "long_title": long_title,
+            "long_title_source": long_title_source,
+            "long_title_suspect": long_title_suspect,
+            "price_currency": price_currency or ("MYR" if price_value else ""),
+            "price": price_str,
+            "price_source": price_source,
+            "listing_date": listing_date,
+            "listing_date_source": listing_date_source,
             "tenure": tenure,
             "bedroom": bed_n or "",
             "bathroom": bath_n or "",
@@ -1589,7 +2082,12 @@ def run():
     out_csv = os.path.join(root, OUT_BASENAME)
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
-            "file","url","tenure",
+            "file","url",
+            "short_title","short_title_source",
+            "long_title","long_title_source","long_title_suspect",
+            "price_currency","price","price_source",
+            "listing_date","listing_date_source",
+            "tenure",
             "bedroom","bathroom","bedroom_raw","bathroom_raw",
             "car_park","car_park_raw","car_park_raw_list",
             "lister_phone_raw","lister_phone_digits",
