@@ -187,24 +187,6 @@ def _first_non_empty(*candidates):
                 return c
     return None
 
-
-def _normalize_subtitle_text(text):
-    if _is_blank(text):
-        return ""
-    txt = unescape(str(text))
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    txt = re.sub(r"\s+", " ", txt).strip()
-    return txt
-
-
-def _normalize_location_text(text):
-    if _is_blank(text):
-        return ""
-    txt = unescape(str(text))
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    txt = re.sub(r"\s+", " ", txt).strip(" ,")
-    return txt
-
 MY_TZ = timezone(timedelta(hours=8))
 SHORT_TITLE_FORBIDDEN_RE = re.compile(r"\b(for sale|for rent|psf|iproperty)\b", re.I)
 SHORT_TITLE_BY_RE = re.compile(r"\bby\b", re.I)
@@ -551,23 +533,6 @@ def extract_price(html, soup, is_rent):
 
     best = candidates[0]
     return best["currency"], best["amount"], best["source"]
-
-
-def extract_description_title(soup):
-    for node in soup.select(".description-block-root h3.subtitle"):
-        txt = node.get_text(" ", strip=True)
-        cleaned = _normalize_subtitle_text(txt)
-        if cleaned:
-            return cleaned, "dom"
-
-    for root in _collect_all_json(soup):
-        value = jget(root, ["descriptionBlockData", "subtitle"])
-        if isinstance(value, str):
-            cleaned = _normalize_subtitle_text(value)
-            if cleaned:
-                return cleaned, "json"
-
-    return "", ""
 
 
 def extract_short_title(soup, url):
@@ -1643,7 +1608,7 @@ def extract_full_address(soup):
             return _normalize_address(str(v).strip()), "state.fullAddress"
     for o in extract_ld_objects(soup, "RealEstateListing"):
         try:
-            street = jget(o, ["spatialCoverage", "address", "streetAddress"])
+            street = jget(o, ["spatialCoverage", "location", "streetAddress"])
             if not _is_blank(street):
                 return _normalize_address(str(street).strip()), "jsonld.streetAddress"
         except Exception:
@@ -2161,7 +2126,6 @@ def run():
         soup = BeautifulSoup(html, "html.parser")
 
         url = extract_url(html, soup) or ""
-        title, title_source = extract_description_title(soup)
         short_title, short_title_source = extract_short_title(soup, url)
         long_title, long_title_source, long_title_suspect = extract_long_title(soup, short_title)
         listing_id = extract_listing_id(html, soup)
@@ -2219,8 +2183,6 @@ def run():
         rows.append({
             "file": name,
             "url": url,
-            "title": title,
-            "title_source": title_source,
             "short_title": short_title,
             "short_title_source": short_title_source,
             "long_title": long_title,
@@ -2232,30 +2194,28 @@ def run():
             "listing_date": listing_date,
             "listing_date_source": listing_date_source,
             "tenure": tenure,
-            "bedroom": bed_n or "",
-            "bathroom": bath_n or "",
+            "rooms": bed_n or "",
+            "toilets": bath_n or "",
             "bedroom_raw": bed_raw or "",
             "bathroom_raw": bath_raw or "",
             "car_park": car_park or "",
             "car_park_raw": car_park_raw or "",
             "car_park_raw_list": " | ".join(car_park_list) if car_park_list else "",
             "lister_phone_raw": lister_phone_raw,
-            "lister_phone_digits": lister_phone_digits,
+            "phone": lister_phone_digits,
             "agent_name": agent_name,
             "agent_name_source": agent_name_source,
-            "agency_name": agency_name,
+            "agency": agency_name,
             "agency_id": agency_id,
             "agency_id_source": agency_id_source,
             "lister_id": lister_id,
             "lister_id_source": lister_id_source,
             "furnishing": furnishing,
             "furnishing_raw": furnishing_raw,
-            "state": state,
-            "district": district,
-            "address": address,
-            "address_source": address_source,
+            "location": address,
+            "location_source": address_source,
             "lister_url": lister_url,
-            "license": license_no,
+            "REN": license_no,
             "amenities": "; ".join(amenities) if amenities else "",
             "bumi_lot": bumi_lot,
             "bumi_lot_raw": bumi_lot_raw,
@@ -2273,22 +2233,20 @@ def run():
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "file","url",
-            "title","title_source",
             "short_title","short_title_source",
             "long_title","long_title_source","long_title_suspect",
             "price_currency","price","price_source",
             "listing_date","listing_date_source",
             "tenure",
-            "bedroom","bathroom","bedroom_raw","bathroom_raw",
+            "rooms","toilets","bedroom_raw","bathroom_raw",
             "car_park","car_park_raw","car_park_raw_list",
-            "lister_phone_raw","lister_phone_digits",
+            "lister_phone_raw","phone",
             "agent_name","agent_name_source",
-            "agency_name","agency_id","agency_id_source",
+            "agency","agency_id","agency_id_source",
             "lister_id","lister_id_source",
             "furnishing","furnishing_raw",
-            "state","district",
-            "address","address_source",
-            "lister_url","license",
+            "location","location_source",
+            "lister_url","REN",
             "amenities",
             "bumi_lot","bumi_lot_raw",
             "land_size","land_psf","land_raw","land_source","land_psf_source",
@@ -2303,7 +2261,7 @@ def run():
     if rows:
         print('--- Preview (first 5 rows) ---')
         for r in rows[:5]:
-            print({k: r[k] for k in ['file','tenure','bedroom','bathroom','built_up','built_up_psf','license']})
+            print({k: r[k] for k in ['file','tenure','rooms','toilets','built_up','built_up_psf','REN']})
 
 if __name__ == "__main__":
     run()
