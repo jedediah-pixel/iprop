@@ -199,6 +199,14 @@ def _normalize_inline_text(value):
     return text.strip()
 
 MY_TZ = timezone(timedelta(hours=8))
+
+
+def _ensure_my_datetime(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=MY_TZ)
+    return dt.astimezone(MY_TZ)
 SHORT_TITLE_FORBIDDEN_RE = re.compile(r"\b(for sale|for rent|psf|iproperty)\b", re.I)
 SHORT_TITLE_BY_RE = re.compile(r"\bby\b", re.I)
 SHORT_TITLE_RM_RE = re.compile(r"\brm\b", re.I)
@@ -286,45 +294,79 @@ def _clean_long_title(text):
 
 
 def _ensure_my_date(dt):
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=MY_TZ)
-    else:
-        dt = dt.astimezone(MY_TZ)
-    return dt.date()
+    dt = _ensure_my_datetime(dt)
+    return dt.date() if dt else None
 
 
-def _parse_date_value(value):
+def _parse_datetime_value(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
         try:
-            return _ensure_my_date(datetime.fromtimestamp(float(value), tz=timezone.utc))
+            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
         except Exception:
             return None
+        return _ensure_my_datetime(dt)
     s = str(value).strip()
     if not s:
         return None
     if re.fullmatch(r"\d{8}", s):
         try:
             dt = datetime.strptime(s, "%Y%m%d")
-            return _ensure_my_date(dt)
+            return _ensure_my_datetime(dt)
         except Exception:
             pass
     iso_candidate = s.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(iso_candidate)
-        return _ensure_my_date(dt)
-    except Exception:
-        pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%d/%m/%Y"):
+    for candidate in (iso_candidate, s):
+        try:
+            dt = datetime.fromisoformat(candidate)
+            return _ensure_my_datetime(dt)
+        except Exception:
+            continue
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M",
+        "%d %b %Y",
+        "%d %B %Y %H:%M:%S",
+        "%d %B %Y %H:%M",
+        "%d %B %Y",
+        "%b %d, %Y %H:%M:%S",
+        "%b %d, %Y %H:%M",
+        "%b %d, %Y",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+    ):
         try:
             dt = datetime.strptime(s, fmt)
-            return _ensure_my_date(dt)
+            return _ensure_my_datetime(dt)
         except Exception:
             continue
     return None
+
+
+def _parse_datetime_candidate(value):
+    dt = _parse_datetime_value(value)
+    if not dt:
+        return None, False
+    has_time = False
+    if isinstance(value, (int, float)):
+        has_time = True
+    elif isinstance(value, str):
+        s = value.lower()
+        if (":" in s) or ("t" in s) or ("am" in s) or ("pm" in s):
+            has_time = True
+    if has_time and dt.time() == datetime.min.time():
+        has_time = False
+    return dt, has_time
+
+
+def _parse_date_value(value):
+    dt = _parse_datetime_value(value)
+    return dt.date() if dt else None
 
 
 # ------------------- FIELD EXTRACTORS -------------------
@@ -677,8 +719,26 @@ def extract_description_title(soup):
     return ""
 
 
-def extract_listing_date(soup):
+def extract_posted_datetime(soup):
     today = datetime.now(MY_TZ).date()
+
+    def valid_dt(dt):
+        if not dt:
+            return False
+        dt_local = _ensure_my_datetime(dt)
+        if not dt_local:
+            return False
+        date_part = dt_local.date()
+        return (date_part.year >= 2000) and (date_part <= today)
+
+    def finalize(dt, has_time, source):
+        if not valid_dt(dt):
+            return "", "", ""
+        dt_local = _ensure_my_datetime(dt)
+        time_str = dt_local.strftime("%H:%M:%S") if has_time else ""
+        return dt_local.date().isoformat(), time_str, source
+
+    midnight = datetime.min.time()
 
     # 1. DOM metatable "Listed on"
     for node in soup.select('[da-id="metatable-item"], .meta-table__item__wrapper__value'):
@@ -691,52 +751,73 @@ def extract_listing_date(soup):
         if not m:
             continue
         date_obj = _parse_date_value(m.group(1))
-        if date_obj and date_obj.year >= 2000 and date_obj <= today:
-            return date_obj.isoformat(), "dom:liston"
+        if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+            dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+            posted_date, posted_time, source = finalize(dt, False, "dom:liston")
+            if posted_date:
+                return posted_date, posted_time, source
 
     # 2. JSON lastPosted.date
     for root in _collect_all_json(soup):
         last_posted = jget(root, ["listingData", "lastPosted", "date"])
-        if last_posted:
-            date_obj = _parse_date_value(last_posted)
-            if date_obj and date_obj.year >= 2000 and date_obj <= today:
-                return date_obj.isoformat(), "json:lastPosted.date"
+        if not last_posted:
+            continue
+        dt, has_time = _parse_datetime_candidate(last_posted)
+        posted_date, posted_time, source = finalize(dt, has_time, "json:lastPosted.date")
+        if posted_date:
+            return posted_date, posted_time, source
 
     # 3. JSON lastPosted.unix
     for root in _collect_all_json(soup):
         unix_ts = jget(root, ["listingData", "lastPosted", "unix"])
-        if unix_ts:
-            date_obj = _parse_date_value(unix_ts)
-            if date_obj and date_obj.year >= 2000 and date_obj <= today:
-                return date_obj.isoformat(), "json:lastPosted.unix"
+        if not unix_ts:
+            continue
+        dt, has_time = _parse_datetime_candidate(unix_ts)
+        posted_date, posted_time, source = finalize(dt, has_time, "json:lastPosted.unix")
+        if posted_date:
+            return posted_date, posted_time, source
 
     # 4. JSON datePosted / postedAt (most recent)
-    date_candidates = []
+    candidates = []
     for root in _collect_all_json(soup):
         for key in ("datePosted", "postedAt"):
             for path in ([key], ["listingData", key], ["listingDetail", key]):
                 val = jget(root, path)
                 if not val:
                     continue
-                if isinstance(val, list):
-                    iterable = val
-                else:
-                    iterable = [val]
+                iterable = val if isinstance(val, list) else [val]
                 for item in iterable:
+                    dt, has_time = _parse_datetime_candidate(item)
+                    if dt and valid_dt(dt):
+                        candidates.append((_ensure_my_datetime(dt), has_time))
+                        continue
                     date_obj = _parse_date_value(item)
-                    if date_obj and date_obj.year >= 2000 and date_obj <= today:
-                        date_candidates.append(date_obj)
-    if date_candidates:
-        latest = max(date_candidates)
-        return latest.isoformat(), "json:datePosted"
+                    if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                        dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+                        candidates.append((dt, False))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        dt, has_time = candidates[-1]
+        posted_date, posted_time, source = finalize(dt, has_time, "json:datePosted")
+        if posted_date:
+            return posted_date, posted_time, source
 
     # 5. JSON-LD datePublished
     for o in extract_ld_objects(soup, "RealEstateListing"):
-        date_obj = _parse_date_value(o.get("datePublished"))
-        if date_obj and date_obj.year >= 2000 and date_obj <= today:
-            return date_obj.isoformat(), "jsonld:datePublished"
+        dt, has_time = _parse_datetime_candidate(o.get("datePublished"))
+        if dt and valid_dt(dt):
+            posted_date, posted_time, source = finalize(dt, has_time, "jsonld:datePublished")
+            if posted_date:
+                return posted_date, posted_time, source
+        else:
+            date_obj = _parse_date_value(o.get("datePublished"))
+            if date_obj and (date_obj.year >= 2000) and (date_obj <= today):
+                dt = datetime.combine(date_obj, midnight, tzinfo=MY_TZ)
+                posted_date, posted_time, source = finalize(dt, False, "jsonld:datePublished")
+                if posted_date:
+                    return posted_date, posted_time, source
 
-    return "", ""
+    return "", "", ""
 
 def is_rent_page(soup):
     for item in soup.select(".meta-table__item"):
@@ -2178,7 +2259,7 @@ def run():
         property_type = extract_property_type(html, soup)
         rent = is_rent_page(soup)
         price_currency, price_value, price_source = extract_price(html, soup, rent)
-        listing_date, listing_date_source = extract_listing_date(soup)
+        posted_date, posted_time, posted_date_source = extract_posted_datetime(soup)
         b_val, b_unit = extract_builtup(html, soup)
         psf = extract_builtup_psf(html, soup)
         if psf is None and (not rent) and price_value and b_val:
@@ -2239,8 +2320,9 @@ def run():
             "price_currency": price_currency or ("MYR" if price_value else ""),
             "price": price_str,
             "price_source": price_source,
-            "listing_date": listing_date,
-            "listing_date_source": listing_date_source,
+            "posted_date": posted_date,
+            "posted_time": posted_time,
+            "posted_date_source": posted_date_source,
             "tenure": tenure,
             "rooms": bed_n or "",
             "toilets": bath_n or "",
@@ -2285,7 +2367,7 @@ def run():
             "long_title","long_title_source","long_title_suspect",
             "title",
             "price_currency","price","price_source",
-            "listing_date","listing_date_source",
+            "posted_date","posted_time","posted_date_source",
             "tenure",
             "rooms","toilets","bedroom_raw","bathroom_raw",
             "car_park","car_park_raw","car_park_raw_list",
