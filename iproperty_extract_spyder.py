@@ -1724,17 +1724,85 @@ def extract_property_type(html, soup):
         ["listingData", "propertyTypeText"],
         ["listingData", "propertyTypeLocalizedText"],
         ["listingData", "propertyTypeGroup"],
+        ["listingData", "propertyTypeGroupText"],
+        ["listingData", "category"],
+        ["listingData", "categoryText"],
         ["propertyOverviewData", "propertyInfo", "propertyType"],
         ["propertyOverviewData", "propertyInfo", "propertyTypeText"],
+        ["listingDetail", "propertyType"],
+        ["listingDetail", "propertyTypeText"],
     ]
+    breadcrumb_candidates = []
+    breadcrumb_skip = {
+        "home",
+        "properties",
+        "property",
+        "property for sale",
+        "property for rent",
+        "for sale",
+        "for rent",
+        "new launches",
+        "commercial",
+        "residential",
+        "sale",
+        "rent",
+        "buy",
+        "rent property",
+        "malaysia",
+    }
+
+    def _add_breadcrumb_candidate(names):
+        filtered = [
+            (n or "").strip()
+            for n in names
+            if (n or "").strip() and (n or "").strip().lower() not in breadcrumb_skip
+        ]
+        if not filtered:
+            return
+        if len(filtered) >= 5:
+            breadcrumb_candidates.append(filtered[4])
+        else:
+            breadcrumb_candidates.append(filtered[-1])
+
     for root in _collect_all_json(soup):
         for path in paths:
             val = jget(root, path)
             if not _is_blank(val):
                 return str(val).strip()
+        if isinstance(root, dict):
+            cat = root.get("category") or root.get("propertyType")
+            if not _is_blank(cat):
+                return str(cat).strip()
+            if root.get("@type") == "BreadcrumbList":
+                items = root.get("itemListElement") or []
+                names = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    if _is_blank(name):
+                        itm = item.get("item") if isinstance(item.get("item"), dict) else None
+                        if itm:
+                            name = itm.get("name") or itm.get("title")
+                    if not _is_blank(name):
+                        names.append(_normalize_inline_text(name))
+                if names:
+                    _add_breadcrumb_candidate(names)
     m = re.search(r'"propertyType"\s*:\s*"([^"]+)"', html, re.I)
     if m:
         return m.group(1).strip()
+    if breadcrumb_candidates:
+        return _first_non_empty(*breadcrumb_candidates) or ""
+    crumb_links = soup.select('[da-id="breadcrumb-widget-item-link"]')
+    if crumb_links:
+        dom_names = [
+            _normalize_inline_text(link.get_text(" ", strip=True))
+            for link in crumb_links
+        ]
+        if dom_names:
+            _add_breadcrumb_candidate(dom_names)
+            if breadcrumb_candidates:
+                return _first_non_empty(*breadcrumb_candidates) or ""
     meta_root = soup.select_one('.meta-table-root[da-id="property-details"]')
     if meta_root:
         for item in meta_root.select('.meta-table__item'):
@@ -2791,6 +2859,7 @@ def run():
         rows.append({
             "file": name,
             "url": url,
+            "property_type": property_type,
             # "short_title": short_title,
             # "short_title_source": short_title_source,
             # "long_title": long_title,
@@ -2843,6 +2912,7 @@ def run():
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "file","url",
+            "property_type",
             # "short_title","short_title_source",
             # "long_title","long_title_source","long_title_suspect",
             "title",
