@@ -69,8 +69,28 @@ def _num(s):
 def _digits_only(s):
     return re.sub(r"\D+", "", s or "")
 
+def _ensure_plus_prefix(value):
+    if _is_blank(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text if text.startswith("+") else f"+{text}"
+
 def _is_blank(x):
     return x is None or (str(x).strip() in {"", "-", "N/A", "n/a", "None"})
+
+
+def _base_website(url):
+    if not url:
+        return ""
+    parsed = urlparse(str(url).strip())
+    host = parsed.netloc.lower()
+    if not host:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 def _is_sqft(u):
     u = (u or "").lower()
@@ -406,10 +426,17 @@ def extract_price(html, soup, is_rent):
         nonlocal order
         if amount is None:
             return
-        currency = (currency or "").upper()
-        if currency == "RM":
-            currency = "MYR"
-        if currency and currency != "MYR":
+        currency = (currency or "").upper().strip()
+        if currency and currency not in {"RM", "MYR"}:
+            if "RM" in currency:
+                currency = "RM"
+            elif "MYR" in currency:
+                currency = "RM"
+            else:
+                return
+        if currency == "MYR":
+            currency = "RM"
+        if currency and currency != "RM":
             return
         value = _coerce_price_value(amount)
         if value is None or value <= 0:
@@ -425,7 +452,7 @@ def extract_price(html, soup, is_rent):
         candidates.append(
             {
                 "amount": value,
-                "currency": "MYR",
+                "currency": "RM",
                 "source": source,
                 "priority": priority,
                 "rent_hint": bool(rent_hint),
@@ -454,7 +481,7 @@ def extract_price(html, soup, is_rent):
                 business = price_obj.get("businessFunction") or ""
                 if isinstance(business, str) and "lease" in business.lower():
                     rent_hint = True
-                add_candidate(price_val, currency or "MYR", "flight.price", 4, rent_hint=rent_hint)
+                add_candidate(price_val, currency or "RM", "flight.price", 4, rent_hint=rent_hint)
                 flight_found = True
                 break
         listing_price = jget(root, ["listingData", "price"])
@@ -532,7 +559,7 @@ def extract_price(html, soup, is_rent):
             pick_amount = amounts[0]
         else:
             pick_amount = max(amounts)
-        add_candidate(pick_amount, "MYR", "dom.rm", 2, raw_text=txt, rent_hint=rent_hint)
+        add_candidate(pick_amount, "RM", "dom.rm", 2, raw_text=txt, rent_hint=rent_hint)
 
     # 4. Head titles fallback
     head_candidates = []
@@ -558,7 +585,7 @@ def extract_price(html, soup, is_rent):
         if not mm:
             continue
         rent_hint = bool(RENT_HINT_RE.search(cleaned)) or ("for rent" in cleaned.lower())
-        add_candidate(_parse_price_number(mm.group(1)), "MYR", "head.title", 1, raw_text=cleaned, rent_hint=rent_hint)
+        add_candidate(_parse_price_number(mm.group(1)), "RM", "head.title", 1, raw_text=cleaned, rent_hint=rent_hint)
         break
 
     if not candidates:
@@ -845,7 +872,7 @@ def extract_posted_datetime(soup):
         if not valid_dt(dt):
             return "", "", ""
         dt_local = ensure_my_datetime(dt)
-        time_str = dt_local.strftime("%H:%M:%S") if has_time else ""
+        time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S") if has_time else ""
         return dt_local.date().isoformat(), time_str, source
 
     midnight = datetime.min.time()
@@ -1816,15 +1843,56 @@ def extract_property_type(html, soup):
     return ""
 
 
-def extract_listing_id(html, soup):
-    for root in _collect_all_json(soup):
-        val = jget(root, ["listingData", "listingId"]) or jget(root, ["listingData", "id"])
-        if not _is_blank(val):
-            return str(val).strip()
-    m = re.search(r'"listingId"\s*:\s*"?([0-9A-Za-z-]+)"?', html, re.I)
-    if m:
-        return m.group(1).strip()
+LISTING_ID_VALID_RE = re.compile(r"^(rent|sale)-\d+$", re.I)
+
+
+def _normalize_listing_id_value(value):
+    if value is None:
+        return ""
+    candidate = str(value).strip()
+    if not candidate:
+        return ""
+    candidate_lower = candidate.lower()
+    if LISTING_ID_VALID_RE.fullmatch(candidate_lower):
+        return candidate_lower
     return ""
+
+
+def extract_listing_id(html, soup):
+    """Primary (JSON): ["listingData","listingId"]
+
+    Secondary (JSON): ["enquiryModalData","listing","unifiedListingId"]
+
+    Tertiary (DOM URL fallback): CSS selector link[rel="alternate"][hrefLang="x-default"] → use the href and extract the slug matching /(rent-\d+|sale-\d+)/
+
+    Resolution logic to state explicitly:
+    Return the first non-empty value found in that order.
+    Trim whitespace and accept only values matching ^(rent|sale)-\d+$.
+    Record the source you used: json:listingData.listingId, json:enquiryModalData.listing.unifiedListingId, or dom:link[rel=alternate][hrefLang=x-default]
+    """
+
+    for root in _collect_all_json(soup):
+        primary = _normalize_listing_id_value(jget(root, ["listingData", "listingId"]))
+        if primary:
+            return primary, "json:listingData.listingId"
+
+        secondary = _normalize_listing_id_value(
+            jget(root, ["enquiryModalData", "listing", "unifiedListingId"])
+        )
+        if secondary:
+            return secondary, "json:enquiryModalData.listing.unifiedListingId"
+
+    link = soup.select_one('link[rel="alternate"][hrefLang="x-default"]')
+    if link:
+        href = (link.get("href") or "").strip()
+        if href:
+            match = re.search(r"(rent-\d+|sale-\d+)", href, re.I)
+            if match:
+                tertiary = _normalize_listing_id_value(match.group(1))
+                if tertiary:
+                    return tertiary, "dom:link[rel=alternate][hrefLang=x-default]"
+
+    return "", ""
 
 
 BED_RE = re.compile(r"\bbed(?:room)?s?\b|\bbilik(?:\s*tidur)?\b|\b\d+\s*R\b", re.I)
@@ -2803,7 +2871,8 @@ def run():
         url = extract_url(html, soup) or ""
         short_title, short_title_source = extract_short_title(soup, url)
         long_title, long_title_source, long_title_suspect = extract_long_title(soup, short_title)
-        listing_id = extract_listing_id(html, soup)
+        listing_id, listing_id_source = extract_listing_id(html, soup)
+        ad_id, ad_id_source = listing_id, listing_id_source
         property_type = extract_property_type(html, soup)
         rent = is_rent_page(soup)
         price_currency, price_value, price_source = extract_price(html, soup, rent)
@@ -2815,8 +2884,12 @@ def run():
             if area_sqft and 400 <= area_sqft <= 20000 and 10000 <= price_value <= 50000000:
                 psf = round(price_value / area_sqft, 2)
         if b_val:
-            unit_str = "sq ft" if _is_sqft(b_unit) or (not b_unit) else ("sqm" if _is_sqm(b_unit) else str(b_unit))
-            built_up_str = f"{int(b_val) if float(b_val).is_integer() else b_val} {unit_str}"
+            try:
+                numeric = float(b_val)
+                numeric_str = str(int(round(numeric)))
+            except Exception:
+                numeric_str = str(b_val)
+            built_up_str = _digits_only(numeric_str)
         else:
             built_up_str = ""
         tenure = extract_tenure(html, soup)
@@ -2846,6 +2919,19 @@ def run():
             b_unit,
         )
         land_raw = " | ".join(land_raw_list) if land_raw_list else ""
+        land_area_clean = ""
+        land_numeric = _num(land_size) if land_size else None
+        if land_numeric is not None:
+            try:
+                land_area_clean = _digits_only(str(int(round(float(land_numeric)))))
+            except Exception:
+                land_area_clean = _digits_only(str(land_numeric))
+        else:
+            land_area_clean = _digits_only(land_size)
+        source_domain = _base_website(url)
+        primary_phone_value = lister_phone_digits or lister_phone_raw
+        phone_display = _ensure_plus_prefix(primary_phone_value)
+        phone_digits_display = _ensure_plus_prefix(lister_phone_digits)
         description_title = extract_description_title(soup)
 
         if price_value is not None:
@@ -2867,7 +2953,7 @@ def run():
             # "long_title_source": long_title_source,
             # "long_title_suspect": long_title_suspect,
             "title": description_title or "",
-            "currency": (price_currency or ("MYR" if price_value else "")) or "",
+            "currency": (price_currency or ("RM" if price_value else "")) or "",
             "price": price_str or "",
             # "price_source": price_source,
             "posted_date": posted_date or "",
@@ -2881,7 +2967,7 @@ def run():
             "car_park": car_park or "",
             # "car_park_raw": car_park_raw or "",
             # "car_park_raw_list": " | ".join(car_park_list) if car_park_list else "",
-            "phone": lister_phone_raw or "",
+            "phone": phone_display or "",
             # "phone": lister_phone_digits,
             "lister": agent_name or "",
             # "agent_name_source": agent_name_source,
@@ -2901,7 +2987,7 @@ def run():
             "amenities": "; ".join(amenities) if amenities else "",
             "bumi_lot": bumi_lot or "",
             # "bumi_lot_raw": bumi_lot_raw,
-            "land_area": land_size or "",
+            "land_area": land_area_clean or "",
             "land_psf": land_psf or "",
             "land_raw": land_raw or "",
             # "land_source": land_source,
@@ -2911,7 +2997,10 @@ def run():
             "property_type": property_type or "",
             "build_up": built_up_str or "",
             "listing_id": listing_id or "",
-            "phone_number": lister_phone_digits or "",
+            "listing_id_source": listing_id_source or "",
+            "ad_id": ad_id or "",
+            "ad_id_source": ad_id_source or "",
+            "phone_number": phone_digits_display or "",
             "phone_number2": "",
             "rent_sale": rent_sale,
             "seller_name": agent_name or "",
@@ -2929,6 +3018,8 @@ def run():
             "updated_date",
         ]:
             row.setdefault(default_key, "")
+        if source_domain:
+            row["source"] = source_domain
         rows.append(row)
         processed += 1
 
