@@ -3006,6 +3006,11 @@ def run():
             "seller_name": agent_name or "",
             "state": state or "",
         }
+        for phone_key in ("phone", "phone_number", "phone_number2"):
+            if row.get(phone_key):
+                row[phone_key] = _ensure_plus_prefix(row[phone_key])
+            else:
+                row[phone_key] = ""
         for default_key in [
             "activate_date",
             "ad_id",
