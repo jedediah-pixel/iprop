@@ -1816,15 +1816,56 @@ def extract_property_type(html, soup):
     return ""
 
 
-def extract_listing_id(html, soup):
-    for root in _collect_all_json(soup):
-        val = jget(root, ["listingData", "listingId"]) or jget(root, ["listingData", "id"])
-        if not _is_blank(val):
-            return str(val).strip()
-    m = re.search(r'"listingId"\s*:\s*"?([0-9A-Za-z-]+)"?', html, re.I)
-    if m:
-        return m.group(1).strip()
+LISTING_ID_VALID_RE = re.compile(r"^(rent|sale)-\d+$", re.I)
+
+
+def _normalize_listing_id_value(value):
+    if value is None:
+        return ""
+    candidate = str(value).strip()
+    if not candidate:
+        return ""
+    candidate_lower = candidate.lower()
+    if LISTING_ID_VALID_RE.fullmatch(candidate_lower):
+        return candidate_lower
     return ""
+
+
+def extract_listing_id(html, soup):
+    """Primary (JSON): ["listingData","listingId"]
+
+    Secondary (JSON): ["enquiryModalData","listing","unifiedListingId"]
+
+    Tertiary (DOM URL fallback): CSS selector link[rel="alternate"][hrefLang="x-default"] → use the href and extract the slug matching /(rent-\d+|sale-\d+)/
+
+    Resolution logic to state explicitly:
+    Return the first non-empty value found in that order.
+    Trim whitespace and accept only values matching ^(rent|sale)-\d+$.
+    Record the source you used: json:listingData.listingId, json:enquiryModalData.listing.unifiedListingId, or dom:link[rel=alternate][hrefLang=x-default]
+    """
+
+    for root in _collect_all_json(soup):
+        primary = _normalize_listing_id_value(jget(root, ["listingData", "listingId"]))
+        if primary:
+            return primary, "json:listingData.listingId"
+
+        secondary = _normalize_listing_id_value(
+            jget(root, ["enquiryModalData", "listing", "unifiedListingId"])
+        )
+        if secondary:
+            return secondary, "json:enquiryModalData.listing.unifiedListingId"
+
+    link = soup.select_one('link[rel="alternate"][hrefLang="x-default"]')
+    if link:
+        href = (link.get("href") or "").strip()
+        if href:
+            match = re.search(r"(rent-\d+|sale-\d+)", href, re.I)
+            if match:
+                tertiary = _normalize_listing_id_value(match.group(1))
+                if tertiary:
+                    return tertiary, "dom:link[rel=alternate][hrefLang=x-default]"
+
+    return "", ""
 
 
 BED_RE = re.compile(r"\bbed(?:room)?s?\b|\bbilik(?:\s*tidur)?\b|\b\d+\s*R\b", re.I)
@@ -2803,7 +2844,8 @@ def run():
         url = extract_url(html, soup) or ""
         short_title, short_title_source = extract_short_title(soup, url)
         long_title, long_title_source, long_title_suspect = extract_long_title(soup, short_title)
-        listing_id = extract_listing_id(html, soup)
+        listing_id, listing_id_source = extract_listing_id(html, soup)
+        ad_id, ad_id_source = listing_id, listing_id_source
         property_type = extract_property_type(html, soup)
         rent = is_rent_page(soup)
         price_currency, price_value, price_source = extract_price(html, soup, rent)
@@ -2911,6 +2953,9 @@ def run():
             "property_type": property_type or "",
             "build_up": built_up_str or "",
             "listing_id": listing_id or "",
+            "listing_id_source": listing_id_source or "",
+            "ad_id": ad_id or "",
+            "ad_id_source": ad_id_source or "",
             "phone_number": lister_phone_digits or "",
             "phone_number2": "",
             "rent_sale": rent_sale,
