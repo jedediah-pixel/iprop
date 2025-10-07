@@ -69,13 +69,22 @@ def _num(s):
 def _digits_only(s):
     return re.sub(r"\D+", "", s or "")
 
-def _ensure_plus_prefix(value):
+def _ensure_plus_prefix(value, *, force_text=False):
+    """Return the value with a leading '+' and optionally mark it as text."""
     if _is_blank(value):
         return ""
     text = str(value).strip()
+    if text.startswith("'"):
+        text = text[1:].lstrip()
     if not text:
         return ""
-    return text if text.startswith("+") else f"+{text}"
+    if text.startswith("+"):
+        normalized = text
+    else:
+        normalized = f"+{text}"
+    if force_text:
+        return f"'{normalized}"
+    return normalized
 
 def _is_blank(x):
     return x is None or (str(x).strip() in {"", "-", "N/A", "n/a", "None"})
@@ -2930,8 +2939,8 @@ def run():
             land_area_clean = _digits_only(land_size)
         source_domain = _base_website(url)
         primary_phone_value = lister_phone_digits or lister_phone_raw
-        phone_display = _ensure_plus_prefix(primary_phone_value)
-        phone_digits_display = _ensure_plus_prefix(lister_phone_digits)
+        phone_display = _ensure_plus_prefix(primary_phone_value, force_text=True)
+        phone_digits_display = _ensure_plus_prefix(lister_phone_digits, force_text=True)
         description_title = extract_description_title(soup)
 
         if price_value is not None:
@@ -3008,7 +3017,7 @@ def run():
         }
         for phone_key in ("phone", "phone_number", "phone_number2"):
             if row.get(phone_key):
-                row[phone_key] = _ensure_plus_prefix(row[phone_key])
+                row[phone_key] = _ensure_plus_prefix(row[phone_key], force_text=True)
             else:
                 row[phone_key] = ""
         for default_key in [
