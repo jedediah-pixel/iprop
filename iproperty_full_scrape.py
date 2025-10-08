@@ -21,6 +21,15 @@ import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse
 
+from iproperty_extract_spyder import (
+    extract_agent_name as spyder_extract_agent_name,
+    extract_agency_id as spyder_extract_agency_id,
+    extract_agency_name as spyder_extract_agency_name,
+    extract_lister_id as spyder_extract_lister_id,
+    extract_lister_phone as spyder_extract_lister_phone,
+    extract_state_district as spyder_extract_state_district,
+)
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -1614,6 +1623,31 @@ def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
         return out
 
     soup = BeautifulSoup(html, "html.parser")
+
+    # Pointer-aligned helpers from Spyder extractor
+    try:
+        state_ptr, _, district_ptr, _ = spyder_extract_state_district(soup)
+    except Exception:
+        state_ptr = ""
+        district_ptr = ""
+    try:
+        phone_raw_ptr, phone_digits_ptr = spyder_extract_lister_phone(soup)
+    except Exception:
+        phone_raw_ptr = ""
+        phone_digits_ptr = ""
+    try:
+        agent_name_ptr, _ = spyder_extract_agent_name(html, soup)
+    except Exception:
+        agent_name_ptr = ""
+    try:
+        agency_name_ptr = spyder_extract_agency_name(soup)
+    except Exception:
+        agency_name_ptr = ""
+    try:
+        agency_id_ptr, _ = spyder_extract_agency_id(soup)
+    except Exception:
+        agency_id_ptr = ""
+
     # Parse JSON candidates
     cand = _script_json_candidates(soup)
     state = _try_parse_state(html)
@@ -1804,6 +1838,8 @@ def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
 
     # Agent block (name/profile/agency/REN)
     agent_name, agent_url, agency_brand, ren_no, agent_id = _extract_agent_block(html)
+    if agent_name_ptr:
+        agent_name = agent_name_ptr
 
     # Pull basic fields from JSON-LD if present
     offers = listing.get("offers") or {}
@@ -1830,13 +1866,19 @@ def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
     # property_type via JSON-LD (rare) else breadcrumbs
     property_type = listing.get("category","") or ptype_bc
 
-    # location bits from breadcrumbs
-    state   = state_bc
-    subarea = sub_bc
-    district= sub_bc
+    # location bits from breadcrumbs + pointer alignment
+    state   = state_ptr or state_bc
+    district= district_ptr or sub_bc
+    subarea = sub_bc or district
 
     # listing_id: prefer meta facts → URL tail fallback
     listing_id = facts.get("listing_id") or (extract_listing_id(url_in) or "")
+    try:
+        agent_id_ptr, _ = spyder_extract_lister_id(html, soup, listing_id=listing_id, agent_name=agent_name)
+    except Exception:
+        agent_id_ptr = ""
+    if agent_id_ptr:
+        agent_id = agent_id_ptr
 
     # price_per_square_feet from meta facts ('RM xx psf (floor)')
     price_per_sf = facts.get("psf","")
@@ -1882,6 +1924,10 @@ def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
             if em and em not in mail_emails:
                 mail_emails.append(em)
     phones_join = "; ".join(tel_nums)
+    if phone_raw_ptr:
+        phones_join = phone_raw_ptr
+    if phone_digits_ptr:
+        whatsapp = phone_digits_ptr if phone_digits_ptr.startswith("+") else f"+{phone_digits_ptr}"
     emails_join = "; ".join(sorted(set([e.lower() for e in mail_emails])))
 
     # lister / agency fields (best-effort from DOM)
@@ -1889,6 +1935,10 @@ def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
     lister_url  = agent_url or ""
     license_raw = ("REN " + ren_no) if ren_no else ""
     agency_name = agency_brand or ""
+    if agency_name_ptr:
+        agency_name = agency_name_ptr
+    organisation_id = agency_id_ptr or ""
+    lister_type_value = "agent" if agent_id else ""
 
     return {
         # meta
@@ -1937,19 +1987,19 @@ def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
         "facilities": "",
 
         # lister
-        "lister_type": "",
+        "lister_type": lister_type_value,
         "lister_id": agent_id or "",
         "lister_name": lister_name,
         "license": license_raw,
         "lister_url": lister_url,
         "lister_image_url": "",
         "phones": phones_join,
-        "whatsapp": "",
+        "whatsapp": whatsapp,
         "emails": emails_join,
 
         # agency
         "agency_name": agency_name,
-        "organisation_id": "",
+        "organisation_id": organisation_id,
         "agency_type": "",
         "agency_emails": "",
 
