@@ -11,7 +11,7 @@ Two-Phase iProperty Runner: ADLIST (SRP) -> ADVIEW (Detail)
 - NEW: Network usage metering (MB) for ADLIST/ADVIEW, reported in Discord on CSV upload
 """
 
-import os, re, io, time, json, math, gzip, zipfile, random, queue, heapq, threading, logging, shutil, sys
+import os, re, io, time, json, math, gzip, zipfile, random, queue, heapq, threading, logging, shutil, sys, csv
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,12 +21,12 @@ import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse
 
+import iproperty_extract_spyder as spyder
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-
-from iproperty_v16_core import extract_iproperty_v16_from_html
 
 try:
     from tqdm import tqdm
@@ -1286,748 +1286,145 @@ def rf_normalize_facilities(ld: dict) -> str:
 
 
 def extract_adview_fields_from_html(html: str, url_in: str) -> dict:
-    """
-    Script-1 aligned:
-      0) React Flight payload (preferred)
-      1) Marketplace Next/State JSON fallback (contactAgentData + details/metatable)
-      2) JSON-LD RealEstateListing + DOM (breadcrumbs, meta facts, agent, tel/mailto)
-      3) v16 baseline (last resort)
-    Outputs only the non-redundant fields we agreed on.
-    """
-    from bs4 import BeautifulSoup
-    import re, json
-
-    # -------------------- 0) React Flight (Script 1) --------------------
-    best = pick_best_node_from_flight(html)
-    ld = best.get("listingDetail", {}) or {}
-
-    if ld:
-        # Meta / identifiers
-        url            = ld.get("shareLink") or url_in or ""
-        listing_id     = ld.get("id") or ""
-        reference_code = ld.get("referenceCode") or ""
-        title          = ld.get("title") or ""
-        property_type  = ld.get("propertyType") or ""
-
-        # Location
-        state    = rf_pick_first(ld, ["languagePlace.level1","multilanguagePlace.enGB.level1","languagePlace.level10"]) or ""
-        district = rf_pick_first(ld, ["languagePlace.level2","multilanguagePlace.enGB.level2","languagePlace.level20"]) or ""
-        subarea  = rf_pick_first(ld, ["languagePlace.level3","multilanguagePlace.enGB.level3","languagePlace.level50"]) or ""
-        address  = rf_pick_first(ld, ["address.formattedAddress"]) or ""
-        lat      = rf_pick_first(ld, ["address.lat"]) or ""
-        lng      = rf_pick_first(ld, ["address.lng"]) or ""
-        location = ", ".join([p for p in [subarea, district, state] if p])
-
-        # Price (single) + currency + built-up PSF
-        price_obj = ld.get("price") or {}
-        currency  = price_obj.get("currency") or ""
-        pmin      = price_obj.get("min")
-        pmax      = price_obj.get("max")
-        price     = pmin if (pmin is not None) else pmax
-        attr           = ld.get("attributes", {}) or {}
-        price_per_sf   = attr.get("pricePerSizeUnitBuiltUp") or ""
-
-        # Attributes
-        title_type  = attr.get("titleType") or ""
-        unit_type   = attr.get("unitType") or ""
-        furnishing  = attr.get("furnishing") or ""
-        tenure      = attr.get("tenure") or ""
-        is_bumi     = attr.get("isBumiLot")
-        land_title  = attr.get("landTitleType") or ""
-        bedroom     = attr.get("bedroom") or ""
-        bathroom    = attr.get("bathroom") or ""
-        built_up    = (attr.get("builtUp") or "").replace(",", "")
-        size_unit   = attr.get("sizeUnit") or ""
-        car_park    = attr.get("carPark") or ""
-        facilities  = rf_normalize_facilities(ld)
-
-        # Timestamps (ISO in payload)
-        updated_at_iso    = ld.get("updatedAt") or ""
-        posted_at_iso     = ld.get("postedAt") or ""
-        published_at_iso  = ld.get("publishedAt") or ""
-
-        # Land PSF (single + computed)
-        land_psf_single = (attr.get("pricePerSizeUnitLandArea") or "").strip()
-        land_psf_min    = (attr.get("minimumPricePerSizeUnitLandArea") or "").strip()
-        land_psf_max    = (attr.get("maximumPricePerSizeUnitLandArea") or "").strip()
-        land_unit       = (attr.get("sizeUnitLandArea") or "").strip()
-        land_price_per_sf = next((x for x in (land_psf_min, land_psf_max, land_psf_single) if str(x).strip()), "")
-
-        land_area_str   = (attr.get("landArea") or "").strip()
-        land_area_val   = None
-        if land_area_str:
-            try:
-                land_area_val = float(re.sub(r"[^\d.]", "", land_area_str))
-            except Exception:
-                land_area_val = None
-
-        land_price_per_sf_computed = ""
-        if (not land_price_per_sf) and (price is not None) and land_area_val and land_area_val > 0:
-            unit_upper = (land_unit or "").upper()
-            area_ft2 = land_area_val * 10.7639 if unit_upper.startswith("SQUARE_METER") else land_area_val
-            try:
-                land_price_per_sf_computed = f"{round(float(price) / float(area_ft2), 2)}" if area_ft2 > 0 else ""
-            except Exception:
-                land_price_per_sf_computed = ""
-
-        # Lister / Agency / Contacts
-        listers = best.get("listers", []) or []
-        lister1 = (listers[0] if listers else {}) or {}
-        lister_single = best.get("lister", {}) or {}
-        org = best.get("organisation", {}) or {}
-        orgs= best.get("organisations", []) or []
-        org0 = orgs[0] if orgs else {}
-
-        lister_type = lister1.get("type") or lister_single.get("type") or ""
-        lister_id   = lister1.get("id") or lister_single.get("agentId") or ""
-        lister_name = lister1.get("name") or lister_single.get("agentName") or ""
-        license_raw = (lister1.get("license") or lister_single.get("license") or
-                       lister1.get("licenseNumber") or lister1.get("renNo") or
-                       lister1.get("ren") or lister1.get("registrationNo") or "")
-        lister_url  = (lister1.get("website") or lister_single.get("website") or "")
-        lister_img  = rf_pick_first(lister1, ["image.url"]) or rf_pick_first(lister_single, ["image.url"]) or ""
-
-        contact     = lister1.get("contact") or lister_single.get("contact") or {}
-        phones_join = rf_normalize_phones(contact.get("phones"))
-        whatsapp    = contact.get("whatsapp") or ""
-        emails_join = rf_normalize_emails(contact.get("emails"))
-
-        agency_name      = org.get("agencyName") or org0.get("name") or ""
-        organisation_id  = org.get("organisationId") or org0.get("id") or ""
-        agency_type      = org.get("type") or org0.get("type") or ""
-        agency_emails    = rf_normalize_emails(
-            rf_pick_first(best, ["organisation.contact.emails","organisations.0.contact.emails"]) or []
-        )
-
-        return {
-            "url": url,
-            "listing_id": listing_id,
-            "reference_code": reference_code,
-            "title": title,
-            "property_type": property_type,
-            "state": state,
-            "district": district,
-            "subarea": subarea,
-            "location": location,
-            "address": address,
-            "lat": lat,
-            "lng": lng,
-            "price": price,
-            "price_currency": currency,
-            "price_per_square_feet": price_per_sf,
-            "updated_at_iso": updated_at_iso,
-            "posted_at_iso": posted_at_iso,
-            "published_at_iso": published_at_iso,
-            "land_price_per_sf": land_price_per_sf or land_price_per_sf_computed,
-            "land_price_unit": land_unit,
-            "land_price_per_sf_computed": land_price_per_sf_computed,
-            "unit_type": unit_type,
-            "title_type": title_type,
-            "furnishing": furnishing,
-            "tenure": tenure,
-            "is_bumi_lot": is_bumi,
-            "land_title_type": land_title,
-            "bedroom": bedroom,
-            "bathroom": bathroom,
-            "built_up": built_up,
-            "size_unit": size_unit,
-            "car_park": car_park,
-            "facilities": facilities,
-            "lister_type": lister_type,
-            "lister_id": lister_id,
-            "lister_name": lister_name,
-            "license": license_raw,
-            "lister_url": lister_url,
-            "lister_image_url": lister_img,
-            "phones": phones_join,
-            "whatsapp": whatsapp,
-            "emails": emails_join,
-            "agency_name": agency_name,
-            "organisation_id": organisation_id,
-            "agency_type": agency_type,
-            "agency_emails": agency_emails,
-            # keep CSV extras consistent:
-            "listed_date": "",
-            "listed_time": "",
-        }
-
-    # ---------------- 1) Marketplace Next/State JSON fallback ----------------
-    def _balanced_object(text: str, start_idx: int) -> str | None:
-        depth = 0
-        for i, ch in enumerate(text[start_idx:], start_idx):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    return text[start_idx:i+1]
-        return None
-
-    def _try_parse_state(html_text: str):
-        m = re.search(r"window\.__INITIAL_STATE__\s*=\s*{", html_text)
-        if not m: return None
-        raw = _balanced_object(html_text, m.start() + html_text[m.start():].find('{'))
-        if not raw: return None
-        try:
-            return json.loads(raw)
-        except Exception:
-            return None
-
-    def _script_json_candidates(soup: BeautifulSoup):
-        out = []
-        for sc in soup.find_all("script"):
-            txt = (sc.string or sc.text or "").strip()
-            if not txt: continue
-            if '"pageProps"' in txt or '"contactAgentData"' in txt or '"detailsData"' in txt or '"__N_SSP"' in txt:
-                try:
-                    out.append(json.loads(txt))
-                except Exception:
-                    continue
-        return out
-
-    def _walk_find(node, key):
-        results = []
-        def _w(n, p=""):
-            if isinstance(n, dict):
-                if key in n:
-                    results.append(n[key])
-                for k,v in n.items():
-                    _w(v, f"{p}.{k}" if p else k)
-            elif isinstance(n, list):
-                for i,v in enumerate(n):
-                    _w(v, f"{p}[{i}]")
-        _w(node)
-        return results
-
-    def _gather_detail_texts(obj) -> list[str]:
-        texts = []
-        # common structure: detailsData.*.data or .metaTable.items[].{value|text|valueText}
-        def _g(n):
-            if isinstance(n, dict):
-                # widget-like dicts
-                if "metadata" in n and isinstance(n.get("data"), list):
-                    for it in n["data"]:
-                        if isinstance(it, dict):
-                            for k in ("value","text","valueText","label"):
-                                v = it.get(k)
-                                if isinstance(v, str) and v.strip():
-                                    texts.append(v.strip())
-                # metaTable.items
-                mt = n.get("metaTable") or n.get("metatable")
-                if isinstance(mt, dict) and isinstance(mt.get("items"), list):
-                    for it in mt["items"]:
-                        if isinstance(it, dict):
-                            for k in ("value","text","valueText","label"):
-                                v = it.get(k)
-                                if isinstance(v, str) and v.strip():
-                                    texts.append(v.strip())
-                for v in n.values():
-                    _g(v)
-            elif isinstance(n, list):
-                for v in n:
-                    _g(v)
-        _g(obj)
-        # de-dupe, preserve order
-        seen, out = set(), []
-        for t in texts:
-            u = t.lower()
-            if u not in seen:
-                seen.add(u)
-                out.append(t)
-        return out
-
-    def _pick_by_keywords(lines: list[str]) -> dict:
-        out = {
-            "tenure":"", "title_type":"", "is_bumi_lot":"",
-            "built_up":"", "price_per_square_feet":"",
-            "furnishing":"", "unit_type":"", "car_park":"",
-            "land_title_type":"", "listed_date":"", "listed_time":"", "size_unit":""
-        }
-        TENURE_RX    = re.compile(r'\b(freehold|leasehold|pegangan\s*bebas|pajakan)\b', re.I)
-        TITLE_RX     = re.compile(r'\b(strata(?:[-\s]*title)?|individual(?:[-\s]*title)?)\b', re.I)
-        BUMI_NOT_RX  = re.compile(r'\b(not|non|bukan)\s*[-\s]*bumi\b', re.I)
-        BUMI_ANY_RX  = re.compile(r'\bbumi\b', re.I)
-        PSF_RX       = re.compile(r'RM\s*([\d,]+(?:\.\d+)?)\s*psf', re.I)
-        BUILT_RX     = re.compile(r'([\d,\.]+)\s*sqft.*?(built|floor)\s*area', re.I)
-        FURN_RX      = re.compile(r'\b(fully\s*furnished|part(?:ly|ially)\s*furnished|unfurnished|bare\s*unit)\b', re.I)
-        UNIT_RX      = re.compile(r'\b(corner|intermediate|end)\s*lot\b', re.I)
-        CARPARK_RX   = re.compile(r'\b(\d+)\s*(?:car\s*park|carpark|parking)\b', re.I)
-        LON_RX       = re.compile(r'(?i)\bListed on\s+([0-9]{1,2}\s+\w+\s+\d{4})(?:\s+(\d{1,2}:\d{2}))?')
-
-        for t in lines:
-            # tenure
-            m = TENURE_RX.search(t)
-            if m and not out["tenure"]:
-                val = m.group(1).lower()
-                out["tenure"] = "Freehold" if ("free" in val or "bebas" in val) else "Leasehold"
-            # title_type
-            m = TITLE_RX.search(t)
-            if m and not out["title_type"]:
-                out["title_type"] = "Strata" if "strata" in m.group(1).lower() else "Individual"
-            # bumi
-            if not out["is_bumi_lot"]:
-                if BUMI_NOT_RX.search(t):
-                    out["is_bumi_lot"] = False
-                elif BUMI_ANY_RX.search(t):
-                    out["is_bumi_lot"] = True
-            # psf
-            m = PSF_RX.search(t)
-            if m and not out["price_per_square_feet"]:
-                out["price_per_square_feet"] = m.group(1).replace(",","")
-            # built_up
-            m = BUILT_RX.search(t)
-            if m and not out["built_up"]:
-                out["built_up"] = m.group(1).replace(",","")
-                out["size_unit"] = out["size_unit"] or "SQUARE_FEET"
-            # furnishing
-            m = FURN_RX.search(t)
-            if m and not out["furnishing"]:
-                x = m.group(1).lower()
-                out["furnishing"] = ("Fully Furnished" if "fully" in x else
-                                     "Partially Furnished" if "part" in x else
-                                     "Unfurnished" if "unfurnished" in x else
-                                     "Bare unit")
-            # unit_type
-            m = UNIT_RX.search(t)
-            if m and not out["unit_type"]:
-                out["unit_type"] = f"{m.group(1).capitalize()} lot"
-            # car_park
-            m = CARPARK_RX.search(t)
-            if m and not out["car_park"]:
-                out["car_park"] = m.group(1)
-            # land_title_type
-            if not out["land_title_type"]:
-                if re.search(r'\bresidential\b', t, re.I): out["land_title_type"] = "Residential"
-                elif re.search(r'\bcommercial\b', t, re.I): out["land_title_type"] = "Commercial"
-                elif re.search(r'\bindustrial\b', t, re.I): out["land_title_type"] = "Industrial"
-                elif re.search(r'\bagricultur', t, re.I):  out["land_title_type"] = "Agriculture"
-                elif re.search(r'\bmixed\b', t, re.I):      out["land_title_type"] = "Mixed"
-            # listed on
-            m = LON_RX.search(t)
-            if m:
-                out["listed_date"] = m.group(1)
-                if m.group(2): out["listed_time"] = m.group(2)
-            # size unit hint
-            if "sqft" in t.lower() and not out["size_unit"]:
-                out["size_unit"] = "SQUARE_FEET"
-
-        return out
-
+    """Extract a single detail page into the Spyder-aligned CSV row structure."""
     soup = BeautifulSoup(html, "html.parser")
-    # Parse JSON candidates
-    cand = _script_json_candidates(soup)
-    state = _try_parse_state(html)
-    if state: cand.append(state)
 
-    # Contact (phones / agent / agency) from contactAgentData
-    phones_join = ""
-    whatsapp = ""
-    lister_type = ""
-    lister_id = ""
-    lister_name = ""
-    lister_url = ""
-    agency_name = ""
-    lister_image_url = ""
-    license_raw = ""
+    url = url_in or spyder.extract_url(html, soup) or ""
+    short_title, short_title_source = spyder.extract_short_title(soup, url)
+    long_title, long_title_source, long_title_suspect = spyder.extract_long_title(soup, short_title)
+    listing_id, listing_id_source = spyder.extract_listing_id(html, soup)
+    ad_id = listing_id
+    property_type = spyder.extract_property_type(html, soup)
+    rent = spyder.is_rent_page(soup)
+    price_currency, price_value, price_source = spyder.extract_price(html, soup, rent)
+    posted_date, posted_time, posted_date_source = spyder.extract_posted_datetime(soup)
+    built_up_value, built_up_unit = spyder.extract_builtup(html, soup)
+    psf = spyder.extract_builtup_psf(html, soup)
+    if psf is None and (rent is False) and price_value and built_up_value:
+        area_sqft = spyder._area_to_sqft(built_up_value, built_up_unit)
+        if area_sqft and 400 <= area_sqft <= 20000 and 10000 <= price_value <= 50000000:
+            psf = round(price_value / area_sqft, 2)
 
-    def _first_nonempty(*vals):
-        for v in vals:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return ""
-
-    def _abs_url(u):
-        u = (u or "").strip()
-        if u.startswith("/"):
-            return "https://www.iproperty.com.my" + u
-        return u
-
-    for obj in cand:
-        if not isinstance(obj, (dict, list)):
-            continue
-        # find contactAgentData
-        stack = [obj]
-        while stack:
-            n = stack.pop()
-            if isinstance(n, dict):
-                if "contactAgentData" in n and isinstance(n["contactAgentData"], dict):
-                    cad = n["contactAgentData"]
-                    card   = (cad.get("contactAgentCard") or {})
-                    sticky = (cad.get("contactAgentStickyBar") or {})
-                    agent1 = ((card.get("agentInfoProps") or {}).get("agent") or {})
-                    agent2 = ((sticky.get("agentInfoProps") or {}).get("agent") or {})
-                    agent  = agent1 or agent2 or {}
-                    mobile = (agent.get("mobile") or "").strip()
-                    if mobile and not phones_join:
-                        phones_join = mobile
-                        whatsapp = re.sub(r"[^\d]", "", mobile)
-                    if not lister_id:
-                        lister_id = str(agent.get("id") or "").strip()
-                    if not lister_name:
-                        lister_name = (agent.get("name") or "").strip()
-                    if not lister_url:
-                        lister_url = _abs_url(agent.get("profileUrl") or "")
-                    # agency
-                    agname = (((card.get("agency") or {}).get("name")) or
-                              ((sticky.get("agency") or {}).get("name")) or "")
-                    if agname and not agency_name:
-                        agency_name = agname.strip()
-                    if lister_id and lister_name:
-                        lister_type = "agent"
-                stack.extend(list(n.values()))
-            elif isinstance(n, list):
-                stack.extend(n)
-
-    # Details/metatable lines → keyword mapping
-    details_texts = []
-    for obj in cand:
-        if isinstance(obj, (dict, list)):
-            details_texts.extend(_gather_detail_texts(obj))
-    # de-dupe preserve order
-    seen, lines = set(), []
-    for t in details_texts:
-        u = t.lower()
-        if u not in seen:
-            seen.add(u)
-            lines.append(t)
-
-    meta = _pick_by_keywords(lines)
-
-    # JSON-LD (posted_at)
-    blocks  = _ld_blocks(html)
-    listing = _ld_first(blocks, "RealEstateListing") or {}
-    offers  = listing.get("offers") or {}
-    price   = offers.get("price")
-    currency= offers.get("priceCurrency") or ""
-    addr_txt= ""
-    sc = listing.get("spatialCoverage") or {}
-    if isinstance(sc, dict):
-        addr = sc.get("address") or {}
-        if isinstance(addr, dict):
-            parts = [addr.get("streetAddress"), addr.get("addressLocality"),
-                     addr.get("postalCode"), addr.get("addressRegion")]
-            addr_txt = ", ".join([p for p in parts if p if str(p).strip()])
-    posted_at_iso = listing.get("datePosted") or listing.get("datePublished") or ""
-
-    # Breadcrumbs → location
-    bc = _extract_breadcrumb_names_from_ld(html)
-    state_bc   = bc[2] if len(bc) >= 3 else ""
-    sub_bc     = bc[3] if len(bc) >= 4 else ""
-    ptype_bc   = bc[4] if len(bc) >= 5 else ""
-    property_type = listing.get("category","") or ptype_bc
-    state = state_bc
-    subarea = sub_bc
-    district = sub_bc
-    listing_id = _parse_meta_facts(html).get("listing_id") or (extract_listing_id(url_in) or "")
-
-    return {
-        # meta
-        "url": url_in,
-        "listing_id": listing_id,
-        "reference_code": "",
-        "title": listing.get("name",""),
-        "property_type": property_type,
-
-        # place
-        "state": state,
-        "district": district,
-        "subarea": subarea,
-        "location": ", ".join([p for p in [subarea, district, state] if p]),
-        "address": addr_txt,
-        "lat": "",
-        "lng": "",
-
-        # price
-        "price": price,
-        "price_currency": currency,
-        "price_per_square_feet": meta.get("price_per_square_feet",""),
-
-        # timestamps
-        "updated_at_iso": "",  # can be derived from lastPosted.* if you choose to add it
-        "posted_at_iso": posted_at_iso,
-        "published_at_iso": "",
-
-        # land PSF (computed from facts if you wish; omitted here)
-        "land_price_per_sf": "",
-        "land_price_unit": "",
-        "land_price_per_sf_computed": "",
-
-        # attrs (from details/metatable keywords)
-        "unit_type": meta.get("unit_type",""),
-        "title_type": meta.get("title_type",""),
-        "furnishing": meta.get("furnishing",""),
-        "tenure": meta.get("tenure",""),
-        "is_bumi_lot": meta.get("is_bumi_lot",""),
-        "land_title_type": meta.get("land_title_type",""),
-        "bedroom": "",   # commercial page: not provided
-        "bathroom": "",  # commercial page: not provided
-        "built_up": meta.get("built_up",""),
-        "size_unit": meta.get("size_unit",""),
-        "car_park": meta.get("car_park",""),
-        "facilities": "",
-
-        # lister (from contactAgentData if present)
-        "lister_type": lister_type,
-        "lister_id": lister_id,
-        "lister_name": lister_name,
-        "license": license_raw,
-        "lister_url": lister_url,
-        "lister_image_url": lister_image_url,
-        "phones": phones_join,
-        "whatsapp": whatsapp,
-        "emails": "",
-
-        # agency
-        "agency_name": agency_name,
-        "organisation_id": "",
-        "agency_type": "",
-        "agency_emails": "",
-
-        # optional CSV extras
-        "listed_date": meta.get("listed_date",""),
-        "listed_time": meta.get("listed_time",""),
-    }
-
-    # ---------------- 2) JSON-LD + DOM fallback (no Flight/Marketplace) ----------------
-    # JSON-LD blocks
-    blocks  = _ld_blocks(html)
-    listing = _ld_first(blocks, "RealEstateListing") or {}
-
-    # Breadcrumbs → (state, subarea, property_type)
-    bc = _extract_breadcrumb_names_from_ld(html)
-    state_bc   = bc[2] if len(bc) >= 3 else ""
-    sub_bc     = bc[3] if len(bc) >= 4 else ""
-    ptype_bc   = bc[4] if len(bc) >= 5 else ""
-
-    # Meta facts strip (.meta-table__item) for tenure/bumi/areas/psf/listing_id
-    facts = _parse_meta_facts(html)  # returns dict with keys used below
-
-    # Agent block (name/profile/agency/REN)
-    agent_name, agent_url, agency_brand, ren_no, agent_id = _extract_agent_block(html)
-
-    # Pull basic fields from JSON-LD if present
-    offers = listing.get("offers") or {}
-    price  = offers.get("price")
-    currency = offers.get("priceCurrency") or ""
-    # address from spatialCoverage.address
-    addr_txt = ""
-    sc = listing.get("spatialCoverage") or {}
-    if isinstance(sc, dict):
-        addr = sc.get("address") or {}
-        if isinstance(addr, dict):
-            parts = [addr.get("streetAddress"), addr.get("addressLocality"),
-                     addr.get("postalCode"), addr.get("addressRegion")]
-            addr_txt = ", ".join([p for p in parts if p])
-
-    # bedrooms/bathrooms from JSON-LD additionalProperty if present
-    props = _ld_additional_props(listing)
-    bedroom  = props.get("bedrooms")  or ""
-    bathroom = props.get("bathrooms") or ""
-
-    # posted/published (JSON-LD often has datePosted)
-    posted_at_iso = listing.get("datePosted") or listing.get("datePublished") or ""
-
-    # property_type via JSON-LD (rare) else breadcrumbs
-    property_type = listing.get("category","") or ptype_bc
-
-    # location bits from breadcrumbs
-    state   = state_bc
-    subarea = sub_bc
-    district= sub_bc
-
-    # listing_id: prefer meta facts → URL tail fallback
-    listing_id = facts.get("listing_id") or (extract_listing_id(url_in) or "")
-
-    # price_per_square_feet from meta facts ('RM xx psf (floor)')
-    price_per_sf = facts.get("psf","")
-
-    # tenure & bumi → map bumi phrase to boolean where possible
-    tenure = facts.get("tenure","")
-    bumi_phrase = (facts.get("bumi_lot","") or "").strip().lower()
-    if bumi_phrase:
-        is_bumi_lot = False if ("not" in bumi_phrase or "non" in bumi_phrase) else True
+    if built_up_value:
+        try:
+            numeric = float(built_up_value)
+            numeric_str = str(int(round(numeric)))
+        except Exception:
+            numeric_str = str(built_up_value)
+        built_up_clean = spyder._digits_only(numeric_str)
     else:
-        is_bumi_lot = ""
+        built_up_clean = ""
 
-    # land PSF computed if we have land_area + price
-    land_price_unit = ""
-    land_price_per_sf = ""
-    land_price_per_sf_computed = ""
-    land_area_str = facts.get("land_area","")
-    if land_area_str and price:
+    tenure = spyder.extract_tenure(html, soup)
+    bed_n, bath_n, bed_raw, bath_raw = spyder.extract_bed_bath(html, soup)
+    car_park, car_park_raw, car_park_list = spyder.extract_car_park(html, soup)
+    lister_phone_raw, lister_phone_digits = spyder.extract_lister_phone(soup)
+    agent_name, agent_name_source = spyder.extract_agent_name(html, soup)
+    lister_id, lister_id_source = spyder.extract_lister_id(html, soup, listing_id, agent_name)
+    agency_name = spyder.extract_agency_name(soup)
+    agency_id, agency_id_source = spyder.extract_agency_id(soup)
+    furnishing, furnishing_raw = spyder.extract_furnishing(html, soup)
+    state, _state_source, district, _district_source = spyder.extract_state_district(soup)
+    address, address_source = spyder.extract_full_address(soup)
+    lister_url = spyder.extract_lister_url(soup)
+    dom_text = spyder.extract_license_visible_text(soup)
+    license_no = spyder.extract_license_ren(soup, dom_text)
+    amenities = spyder.extract_amenities(soup, html)
+    bumi_lot, bumi_lot_raw_list = spyder.extract_bumi_lot(html, soup)
+    land_size, land_psf, land_raw_list, land_source, land_psf_source = spyder.extract_land_size_psf(
+        html,
+        soup,
+        property_type,
+        price_value,
+        rent,
+        built_up_value,
+        built_up_unit,
+    )
+
+    land_raw = " | ".join(land_raw_list) if land_raw_list else ""
+    if land_size:
+        land_numeric = spyder._num(land_size)
+    else:
+        land_numeric = None
+    if land_numeric is not None:
         try:
-            land_area = float(re.sub(r"[^\d.]", "", land_area_str))
-            if land_area > 0:
-                land_price_per_sf_computed = f"{round(float(price)/land_area, 2)}"
-                land_price_unit = "SQUARE_FEET"
+            land_area_clean = spyder._digits_only(str(int(round(float(land_numeric)))))
         except Exception:
-            pass
+            land_area_clean = spyder._digits_only(str(land_numeric))
+    else:
+        land_area_clean = spyder._digits_only(land_size)
 
-    # Built-up from facts floor_area if present (keep Script-1 field naming)
-    built_up = facts.get("floor_area","") or ""
-    if built_up:
-        built_up = re.sub(r"[^\d.]", "", built_up)
+    source_domain = spyder._base_website(url)
+    primary_phone_value = lister_phone_digits or lister_phone_raw
+    phone_display = spyder._ensure_plus_prefix(primary_phone_value, force_text=True)
+    phone_digits_display = spyder._ensure_plus_prefix(lister_phone_digits, force_text=True)
+    description_title = spyder.extract_description_title(soup)
 
-    # Phones/emails: scan <a href="tel:..."> / <a href="mailto:...">
-    soup = BeautifulSoup(html, "html.parser")
-    tel_nums, mail_emails = [], []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.lower().startswith("tel:"):
-            num = href.split(":",1)[1].strip()
-            if num and num not in tel_nums:
-                tel_nums.append(num)
-        elif href.lower().startswith("mailto:"):
-            em = href.split(":",1)[1].strip()
-            if em and em not in mail_emails:
-                mail_emails.append(em)
-    phones_join = "; ".join(tel_nums)
-    emails_join = "; ".join(sorted(set([e.lower() for e in mail_emails])))
+    if price_value is not None:
+        if abs(price_value - round(price_value)) < 1e-6:
+            price_str = str(int(round(price_value)))
+        else:
+            price_str = f"{price_value:.2f}".rstrip("0").rstrip(".")
+    else:
+        price_str = ""
 
-    # lister / agency fields (best-effort from DOM)
-    lister_name = agent_name or ""
-    lister_url  = agent_url or ""
-    license_raw = ("REN " + ren_no) if ren_no else ""
-    agency_name = agency_brand or ""
+    rent_sale = "rent" if rent else ("sale" if rent is not None else "")
 
-    return {
-        # meta
-        "url": url_in,
-        "listing_id": listing_id,
-        "reference_code": "",
-        "title": listing.get("name",""),
-        "property_type": property_type,
-
-        # place
-        "state": state,
-        "district": district,
-        "subarea": subarea,
-        "location": ", ".join([p for p in [subarea, district, state] if p]),
-        "address": addr_txt,
-        "lat": "",
-        "lng": "",
-
-        # price
-        "price": price,
-        "price_currency": currency,
-        "price_per_square_feet": price_per_sf,
-
-        # timestamps
-        "updated_at_iso": "",
-        "posted_at_iso": posted_at_iso,
-        "published_at_iso": "",
-
-        # land PSF (single + computed + unit)
-        "land_price_per_sf": land_price_per_sf or land_price_per_sf_computed,
-        "land_price_unit": land_price_unit,
-        "land_price_per_sf_computed": land_price_per_sf_computed,
-
-        # attrs
-        "unit_type": "",
-        "title_type": "",
-        "furnishing": "",
-        "tenure": tenure,
-        "is_bumi_lot": is_bumi_lot,
-        "land_title_type": "",
-        "bedroom": bedroom,
-        "bathroom": bathroom,
-        "built_up": built_up,
-        "size_unit": "",
-        "car_park": "",
-        "facilities": "",
-
-        # lister
-        "lister_type": "",
-        "lister_id": agent_id or "",
-        "lister_name": lister_name,
-        "license": license_raw,
-        "lister_url": lister_url,
-        "lister_image_url": "",
-        "phones": phones_join,
-        "whatsapp": "",
-        "emails": emails_join,
-
-        # agency
-        "agency_name": agency_name,
-        "organisation_id": "",
-        "agency_type": "",
-        "agency_emails": "",
-
-        "listed_date": "",  # DOM-only in this branch unless your _parse_meta_facts returns them
-        "listed_time": "",
+    row = {
+        "url": url or "",
+        "type": property_type or "",
+        "title": description_title or "",
+        "currency": (price_currency or ("RM" if price_value else "")) or "",
+        "price": price_str or "",
+        "posted_date": posted_date or "",
+        "posted_time": posted_time or "",
+        "rooms": bed_raw or "",
+        "toilets": bath_raw or "",
+        "car_park": car_park or "",
+        "phone": phone_display or "",
+        "lister": agent_name or "",
+        "agency": agency_name or "",
+        "furnishing": furnishing or "",
+        "location": address or "",
+        "region": state or "",
+        "subregion": district or "",
+        "ren": license_no or "",
+        "land_area": land_area_clean or "",
+        "property_type": property_type or "",
+        "build_up": built_up_clean or "",
+        "listing_id": listing_id or "",
+        "ad_id": ad_id or "",
+        "phone_number": phone_digits_display or "",
+        "phone_number2": "",
+        "rent_sale": rent_sale,
+        "seller_name": agent_name or "",
+        "state": state or "",
     }
 
-    # -------------------- 3) v16 baseline (last resort) --------------------
-    v16 = extract_iproperty_v16_from_html(html, url_hint=url_in, source_name="adview_runtime") or {}
-    if not v16:
-        raise RuntimeError("adview_extract_empty:no_listingDetail")
+    for phone_key in ("phone", "phone_number", "phone_number2"):
+        if row.get(phone_key):
+            row[phone_key] = spyder._ensure_plus_prefix(row[phone_key], force_text=True)
+        else:
+            row[phone_key] = ""
 
-    return {
-        # identity & url
-        "url": v16.get("url","") or url_in,
-        "listing_id": v16.get("listing_id") or "",
-        "reference_code": v16.get("reference_code",""),
-        "title": v16.get("title",""),
-        "property_type": v16.get("property_type",""),
+    for default_key in [
+        "activate_date",
+        "ad_id",
+        "created_time",
+        "email",
+        "id",
+        "market",
+        "scrape_date",
+        "source",
+        "updated_date",
+    ]:
+        row.setdefault(default_key, "")
 
-        # location
-        "state": v16.get("state",""),
-        "district": v16.get("district",""),
-        "subarea": v16.get("subarea",""),
-        "location": ", ".join([p for p in [v16.get("subarea",""), v16.get("district",""), v16.get("state","")] if p]),
-        "address": v16.get("address",""),
-        "lat": "",
-        "lng": "",
+    if source_domain:
+        row["source"] = source_domain
 
-        # price + currency + built-up PSF
-        "price": v16.get("price",""),
-        "price_currency": v16.get("price_currency",""),
-        "price_per_square_feet": v16.get("psf","") or v16.get("price_per_square_feet",""),
+    return row
 
-        # timestamps (unknown in v16)
-        "updated_at_iso": "",
-        "posted_at_iso": "",
-        "published_at_iso": "",
-
-        # land PSF
-        "land_price_per_sf": "",
-        "land_price_unit": "",
-        "land_price_per_sf_computed": "",
-
-        # attributes
-        "unit_type": v16.get("unit_type",""),
-        "title_type": v16.get("title_type",""),
-        "furnishing": v16.get("furnishing",""),
-        "tenure": v16.get("tenure",""),
-        "is_bumi_lot": v16.get("is_bumi_lot",""),
-        "land_title_type": v16.get("land_title_type",""),
-        "bedroom": v16.get("bedrooms","") or v16.get("bedroom",""),
-        "bathroom": v16.get("bathrooms","") or v16.get("bathroom",""),
-        "built_up": (v16.get("built_up","") or v16.get("built_up_sqft","")).replace(",",""),
-        "size_unit": v16.get("size_unit",""),
-        "car_park": v16.get("car_park",""),
-        "facilities": v16.get("facilities",""),
-
-        # lister
-        "lister_type": v16.get("lister_type",""),
-        "lister_id": v16.get("lister_id",""),
-        "lister_name": v16.get("lister_name","") or v16.get("agent_name",""),
-        "license": v16.get("license",""),
-        "lister_url": v16.get("lister_url","") or v16.get("agent_url",""),
-        "lister_image_url": v16.get("lister_image_url",""),
-        "phones": v16.get("phones","") or v16.get("phone",""),
-        "whatsapp": v16.get("whatsapp",""),
-        "emails": v16.get("emails",""),
-
-        # agency
-        "agency_name": v16.get("agency_name","") or v16.get("agency",""),
-        "organisation_id": v16.get("organisation_id",""),
-        "agency_type": v16.get("agency_type",""),
-        "agency_emails": v16.get("agency_emails",""),
-
-        "listed_date": "",
-        "listed_time": "",
-    }
 
 
 # ====== Dashboard Builder ======
@@ -2757,59 +2154,113 @@ if __name__ == "__main__":
     adview_csv_path = os.path.join(ADVIEW_DIR, f"iP_adview_{TS}.csv")
     total_rows_view = 0
 
+    provided_order = [
+        "activate_date",
+        "ad_id",
+        "agency",
+        "build_up",
+        "car_park",
+        "created_time",
+        "currency",
+        "email",
+        "furnishing",
+        "id",
+        "land_area",
+        "lister",
+        "listing_id",
+        "location",
+        "market",
+        "phone",
+        "phone_number",
+        "phone_number2",
+        "posted_date",
+        "posted_time",
+        "price",
+        "property_type",
+        "region",
+        "ren",
+        "rent_sale",
+        "rooms",
+        "scrape_date",
+        "seller_name",
+        "source",
+        "state",
+        "subregion",
+        "title",
+        "toilets",
+        "type",
+        "url",
+        "updated_date",
+    ]
+
+    legacy_order = [
+        "url",
+        "type",
+        "title",
+        "currency",
+        "price",
+        "posted_date",
+        "posted_time",
+        "rooms",
+        "toilets",
+        "car_park",
+        "phone",
+        "lister",
+        "agency",
+        "furnishing",
+        "location",
+        "region",
+        "subregion",
+        "ren",
+        "land_area",
+    ]
+
     if hasattr(adview, "adview_rows") and adview.adview_rows:
-        df_view = pd.DataFrame(adview.adview_rows).drop_duplicates(subset=["url"])
-        df_adlist = pd.read_csv(adlist_csv_path)[["url","listed_date","listed_time","scrape_datetime","agent_id","listing_id"]]
-        df_merged = df_view.merge(df_adlist, on="url", how="left", suffixes=("", "_adlist"))
-        df_merged["listing_id"] = df_merged["listing_id"].fillna(df_merged.get("listing_id_adlist"))
-        if "listing_id_adlist" in df_merged.columns: df_merged.drop(columns=["listing_id_adlist"], inplace=True)
+        seen_urls = set()
+        rows_for_csv = []
+        for orig_row in adview.adview_rows:
+            row = dict(orig_row)
+            row.pop("snapshot_path", None)
+            url_key = str(row.get("url", "") or "").strip()
+            if url_key and url_key in seen_urls:
+                continue
+            if url_key:
+                seen_urls.add(url_key)
+            clean_row = {}
+            for key, value in row.items():
+                if value is None:
+                    clean_row[key] = ""
+                elif isinstance(value, float) and math.isnan(value):
+                    clean_row[key] = ""
+                elif isinstance(value, str) and value.strip().lower() == "nan":
+                    clean_row[key] = ""
+                else:
+                    clean_row[key] = str(value)
+            for default_key in provided_order:
+                clean_row.setdefault(default_key, "")
+            if not clean_row.get("ad_id"):
+                clean_row["ad_id"] = clean_row.get("listing_id", "")
+            rows_for_csv.append(clean_row)
 
-        final_cols = [
-            # identity & url
-            "url","listing_id","reference_code","title","property_type",
-        
-            # location
-            "state","district","subarea","location","address","lat","lng",
-        
-            # price (single) + currency + built-up PSF
-            "price","price_currency","price_per_square_feet",
-        
-            # payload timestamps
-            "updated_at_iso","posted_at_iso","published_at_iso",
-        
-            # land PSF (single + computed + unit)
-            "land_price_per_sf","land_price_unit","land_price_per_sf_computed",
-        
-            # attributes
-            "unit_type","title_type","furnishing","tenure","is_bumi_lot","land_title_type",
-            "bedroom","bathroom","built_up","size_unit","car_park","facilities",
-        
-            # lister / contacts
-            "lister_type","lister_id","lister_name","license","lister_url","lister_image_url",
-            "phones","whatsapp","emails",
-        
-            # agency
-            "agency_name","organisation_id","agency_type","agency_emails",
-        
-            # adlist merge info
-            "listed_date","listed_time","scrape_datetime","agent_id",
-        
-            "snapshot_path"
-        ]
+        extra_fields = [field for field in legacy_order if field not in provided_order]
+        for row in rows_for_csv:
+            for key in row.keys():
+                if key not in provided_order and key not in extra_fields:
+                    extra_fields.append(key)
 
-        for c in final_cols:
-            if c not in df_merged.columns: df_merged[c] = None
-        df_final = df_merged[final_cols]
-        df_final.to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
-        total_rows_view = len(df_final)
+        fieldnames = provided_order + extra_fields
+        with open(adview_csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows_for_csv)
+        total_rows_view = len(rows_for_csv)
     else:
-        pd.DataFrame(columns=[
-            "url","listing_id","title","property_type","state","district","subarea","location","address",
-            "price","price_per_square_feet","rooms","toilets","furnishing","floor_area","land_area",
-            "tenure","property_title","bumi_lot","total_units","completion_year","developer",
-            "lister_name","lister_url","phone_number","agency","agency_registration_number","ren_number",
-            "amenities","facilities","listed_date","listed_time","scrape_datetime","agent_id","snapshot_path"
-        ]).to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
+        extra_fields = [field for field in legacy_order if field not in provided_order]
+        fieldnames = provided_order + extra_fields
+        with open(adview_csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+        total_rows_view = 0
 
     print(f"📄 ADVIEW CSV written: {adview_csv_path} (rows: {total_rows_view})")
 
