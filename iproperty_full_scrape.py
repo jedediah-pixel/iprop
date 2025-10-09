@@ -1870,6 +1870,12 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                     row["listing_id"] = l_id_in
                 row["snapshot_path"] = gz_path
 
+                try:
+                    created_ts = os.path.getmtime(gz_path)
+                    row["scrape_date"] = datetime.fromtimestamp(created_ts).strftime("%Y-%m-%d")
+                except Exception:
+                    row["scrape_date"] = datetime.now().strftime("%Y-%m-%d")
+
                 if not hasattr(stage, "adview_rows"):
                     stage.adview_rows = []; stage.adview_rows_lock = threading.Lock()
                 with stage.adview_rows_lock:
